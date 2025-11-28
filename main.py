@@ -37,7 +37,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     try:
         logger.info(f"📡 Requesting: {safe_url}")
-        # *** FIX: 使用正确的 requests.get ***
+        # FIX: 使用正确的 requests.get
         response = requests.get(url, timeout=10)
         if response.status_code != 200: 
             logger.warning(f"FMP API returned status {response.status_code} for {endpoint}")
@@ -54,7 +54,7 @@ def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     try:
-        # *** FIX: 使用正确的 requests.get ***
+        # FIX: 使用正确的 requests.get
         response = requests.get(url, timeout=10)
         return response.json() if response.status_code == 200 else []
     except Exception as e: 
@@ -442,7 +442,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup (隐私模式命令 + analyze 命令) ---
+# --- 4. Bot Setup (新增 /privacy 命令 + /analyze 隐私模式) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -482,32 +482,32 @@ async def privacy(interaction: discord.Interaction):
 async def analyze(interaction: discord.Interaction, ticker: str):
     
     is_privacy_mode = PRIVACY_MODE.get(interaction.user.id, False)
+    ephemeral_result = is_privacy_mode
     
-    # --- 隐私模式逻辑 ---
-    if is_privacy_mode:
-        # 1. 发送公开状态消息 (新两行格式)
+    # --- Step 1: 立即响应 Discord (Defer) ---
+    # Defer privately if privacy mode is ON, otherwise defer publicly.
+    await interaction.response.defer(thinking=True, ephemeral=ephemeral_result) 
+
+    # --- Step 2: 数据获取 (耗时操作) ---
+    model = ValuationModel(ticker)
+    success = await model.fetch_data()
+    
+    # --- Step 3: 条件公共消息 (只有在成功且隐私模式开启时发送) ---
+    if is_privacy_mode and success:
         public_message = (
             f"{interaction.user.mention} 开启 稳-量化估值系统\n"
             f"`{ticker.upper()}` 正在分析中⚡..."
         )
-        await interaction.channel.send(public_message)
+        # 发送公开状态消息
+        await interaction.channel.send(public_message) 
         
-        # 2. 延迟响应，并设置为仅自己可见 (ephemeral=True)
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        ephemeral_result = True
-    else:
-        # 默认模式：公开延迟响应
-        await interaction.response.defer(thinking=True)
-        ephemeral_result = False
-    # --- 隐私模式逻辑结束 ---
-    
-    model = ValuationModel(ticker)
-    success = await model.fetch_data()
-    
+    # --- Step 4: 处理失败 (完成 Deferral) ---
     if not success:
+        # 如果获取失败，发送私密（或公开）失败消息
         await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
         return
 
+    # --- Step 5: 分析与错误处理 ---
     data = model.analyze()
     if not data:
         await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=ephemeral_result)
@@ -578,7 +578,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
     
 
-    # *** Final Response: 使用 ephemeral_result 状态 ***
+    # *** Final Response: 发送最终结果 (完成 Deferral) ***
     await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
 
 if __name__ == "__main__":
