@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.3 Precision Fix) ---
+# --- 3. 估值判断模型 (v6.4 Text Polish) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -163,15 +163,15 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 (v6.3 Smart Fix) ---
+        # --- Meme/信仰值模型 (v6.3 Logic) ---
         meme_score = 0
         
-        # 1. 价格趋势 (FOMO)
+        # 1. 价格趋势
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
             
-        # 2. 极致估值 (Hype)
+        # 2. 极致估值
         if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): 
             meme_score += 4
         elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): 
@@ -179,32 +179,26 @@ class ValuationModel:
         elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): 
             meme_score += 1
             
-        # 3. 波动率 (Action)
+        # 3. 波动率
         if beta > 2.0: meme_score += 2
         elif beta > 1.3: meme_score += 1
             
-        # 4. 现实扭曲因子 (Distortion)
+        # 4. 现实扭曲
         if price and price_200ma and price > price_200ma:
             bad_fcf = (fcf_yield is not None and fcf_yield < 0.01)
             bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
             if bad_fcf or bad_peg:
                 meme_score += 2
             
-        # 5. 人群聚集 (Crowd)
+        # 5. 人群聚集
         if vol_today and vol_avg and vol_avg > 0:
             if vol_today > vol_avg * 1.2: meme_score += 1
         
-        # [核心修复] 业绩护盾 (Quality Shield)
-        # 如果是 NVDA 这种真金白银的业绩，Meme 分数要大打折扣
+        # 业绩护盾
         if roic and roic > 0.20:
-             # 高 ROIC 且 PEG 合理，说明高波动是因为机构在抢筹，不是散户瞎炒
-            if peg and 0 < peg < 3.0: 
-                meme_score -= 3
-            # 即使稍微贵点，ROIC 极高也应该减分
-            else: 
-                meme_score -= 1
+            if peg and 0 < peg < 3.0: meme_score -= 3
+            else: meme_score -= 1
         
-        # 限制分数范围
         meme_score = max(0, min(10, meme_score))
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 60
@@ -214,12 +208,12 @@ class ValuationModel:
         
         # --- 短期估值逻辑 (含亏损熔断) ---
         
-        # [核心修复] 亏损熔断：如果公司在亏钱，EV/EBITDA 再低也不能叫便宜
+        # [核心修复] 亏损熔断
         is_distressed = False
         if (net_margin is not None and net_margin < -0.05) or (fcf_yield is not None and fcf_yield < -0.02):
             is_distressed = True
-            st_status = "基本面恶化"
-            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效，警惕低估值陷阱。")
+            st_status = "极其昂贵" # [修改] 文案更直观
+            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效。") # [修改] 删掉废话
         
         if not is_distressed:
             if ev_ebitda is not None:
@@ -290,7 +284,7 @@ class ValuationModel:
             if fcf_yield is None:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        # D. Alpha 信号 (v5.8 Time-Aware)
+        # D. Alpha 信号 (v6.4 No-Date)
         valid_earnings = []
         today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -310,16 +304,16 @@ class ValuationModel:
             beats = sum(1 for x in recent if x["act"] > x["est"])
             total = len(recent)
             beat_rate = beats / total
-            last_report_date = recent[0]['date']
             
+            # [修改] 不显示具体日期，只显示结论
             if beat_rate >= 0.75:
-                self.logs.append(f"[Alpha] 截至 {last_report_date}，过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
+                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
             else:
-                self.logs.append(f"[Alpha] 截至 {last_report_date}，过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
+                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
         else:
             self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
 
-        # --- 策略修正层 (v6.0 Strategy) ---
+        # --- 策略修正层 ---
         if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
             self.strategy = "看似估值极低，但营收处于萎缩周期，需警惕'低估值陷阱'。"
             lt_status = "周期性风险"
@@ -366,7 +360,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v6.3] 估值分析 (陷阱识别+业绩护盾)")
+@bot.tree.command(name="analyze", description="[v6.4] 估值分析 (文案精修版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
