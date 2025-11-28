@@ -6,19 +6,17 @@ import os
 import asyncio
 from dotenv import load_dotenv
 
-# 加载环境变量
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
 
-# FMP 接口配置
+# FMP 稳定接口
 BASE_URL = "https://financialmodelingprep.com/stable"
 
-# --- 数据获取与处理逻辑 ---
-
-def get_fmp_data(endpoint, ticker):
-    url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}"
+# --- 数据工具函数 ---
+def get_fmp_data(endpoint, ticker, params=""):
+    url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}&{params}"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -30,202 +28,269 @@ def get_fmp_data(endpoint, ticker):
         print(f"Error fetching {endpoint} for {ticker}: {e}")
         return None
 
-def format_num(num, is_currency=False):
+def format_percent(num):
     if num is None: return "N/A"
-    if is_currency: return f"${num:,.2f}"
+    return f"{num * 100:.2f}%"
+
+def format_num(num):
+    if num is None: return "N/A"
     return f"{num:.2f}"
 
-class ValuationModel:
+# --- 核心量化模型 (Quant Alpha) ---
+
+class QuantAlphaModel:
     def __init__(self, ticker):
         self.ticker = ticker.upper()
         self.data = {}
+        
+        # 评分系统
         self.score = 0
-        self.verdict = "未知"
-        self.risk_tag = "未知"
+        self.max_score = 100
+        self.verdict = "N/A"
+        
+        # 因子分析日志
+        self.logs = []
+        self.flags = [] # 严重的红牌警告
 
-    async def fetch_all(self):
+    async def fetch_data(self):
         loop = asyncio.get_event_loop()
+        # 并行获取 5 个核心接口
         tasks = {
-            "profile": loop.run_in_executor(None, get_fmp_data, "profile", self.ticker),
-            "dcf": loop.run_in_executor(None, get_fmp_data, "discounted-cash-flow", self.ticker),
-            "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker),
-            "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker)
+            "profile": loop.run_in_executor(None, get_fmp_data, "profile", self.ticker, ""),
+            "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
+            "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
+            "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
+            "cash_flow": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "limit=1") # 取最新年报做质量审计
         }
+        
         results = await asyncio.gather(*tasks.values())
         self.data = dict(zip(tasks.keys(), results))
-        return self.data["profile"] is not None
-
-    def calculate_valuation(self):
-        profile = self.data.get("profile", {})
-        dcf_data = self.data.get("dcf", {})
-        ratios = self.data.get("ratios", {})
-        metrics = self.data.get("metrics", {})
-
-        if not profile: return None
-
-        current_price = profile.get("price")
-        beta = profile.get("beta", 1.0)
-        dcf_value = dcf_data.get("dcf")
         
-        peg = ratios.get("pegRatioTTM")
-        pe = ratios.get("priceEarningsRatioTTM")
-        ev_ebitda = metrics.get("enterpriseValueOverEBITDATTM")
+        return self.data["profile"] is not None and self.data["quote"] is not None
 
-        # 1. 风险定性
-        if beta > 1.5:
-            self.risk_tag = "⚠️ 高波动 (High Beta)"
-            margin_requirement = 1.25
-        elif beta < 0.8:
-            self.risk_tag = "🛡️ 防御型 (Low Beta)"
-            margin_requirement = 1.0
-        else:
-            self.risk_tag = "⚖️ 市场平均波动"
-            margin_requirement = 1.1
+    def analyze(self):
+        # 提取数据
+        p = self.data.get("profile", {})
+        q = self.data.get("quote", {})
+        m = self.data.get("metrics", {})
+        r = self.data.get("ratios", {})
+        cf = self.data.get("cash_flow", {}) # 可能返回list
 
-        analysis_log = []
+        if not p or not q: return None
 
-        # 2. 估值打分 (逻辑保持严谨)
-        # DCF
-        if dcf_value:
-            upside = (dcf_value - current_price) / current_price
-            if upside > 0.2 * margin_requirement:
-                self.score += 4
-                analysis_log.append(f"✅ 价格低于内在价值 (空间 +{upside*100:.1f}%)")
-            elif upside > 0:
-                self.score += 2
-                analysis_log.append(f"☑️ 价格接近内在价值 (公允)")
-            elif upside < -0.2:
-                self.score -= 2
-                analysis_log.append(f"❌ 价格高于内在价值 (溢价 {abs(upside*100):.1f}%)")
+        price = q.get("price")
+        sector = p.get("sector", "Unknown")
+        beta = p.get("beta", 1.0)
+        
+        # ----------------------------------------------------
+        # 第一关：财务质量排雷 (Accounting Quality) - 权重: 20分 / 一票否决
+        # ----------------------------------------------------
+        net_income = cf.get("netIncome") if cf else 0
+        ocf = cf.get("operatingCashFlow") if cf else 0
+        
+        quality_score = 20
+        if net_income and ocf:
+            # 逻辑：如果你赚了1亿净利润，但经营现金流只有5000万，说明你在压货或者赊账，财报质量差
+            if ocf < net_income * 0.8:
+                quality_score = 0
+                self.flags.append(f"🚩 **财报质量警报**: 经营现金流大幅低于净利润 (Accruals Risk)")
+                self.logs.append(f"❌ 现金流健康度: 差 (NI ${format_num(net_income/1e6)}M vs OCF ${format_num(ocf/1e6)}M)")
+            elif ocf > net_income * 1.1:
+                self.logs.append(f"✅ 现金流强劲: OCF 覆盖率高 (含金量高)")
             else:
-                analysis_log.append(f"⚠️ 价格略有溢价")
+                self.logs.append(f"☑️ 现金流正常匹配")
+        else:
+            self.logs.append("⚠️ 缺少现金流数据，跳过质量审计")
+            quality_score = 10
+        
+        self.score += quality_score
 
-        # PEG
-        if peg:
-            if 0 < peg < 1.0:
-                self.score += 3
-                analysis_log.append(f"✅ PEG {peg:.2f} < 1 (成长性被低估)")
-            elif 1.0 <= peg < 1.5:
-                self.score += 1
-                analysis_log.append(f"☑️ PEG {peg:.2f} (估值与成长匹配)")
-            elif peg > 2.0:
-                self.score -= 2
-                analysis_log.append(f"❌ PEG {peg:.2f} (透支未来业绩)")
-
-        # EV/EBITDA
+        # ----------------------------------------------------
+        # 第二关：硬核估值 (FCF Yield & EV/EBITDA) - 权重: 40分
+        # ----------------------------------------------------
+        # 使用 FCF Yield 替代 DCF。FCF Yield > 4% 也就是相当于 25倍 PE 的倒数，但更真实。
+        fcf_yield = m.get("freeCashFlowYieldTTM")
+        ev_ebitda = m.get("enterpriseValueOverEBITDATTM")
+        
+        val_score = 0
+        
+        # FCF Yield 评分 (20分)
+        if fcf_yield:
+            if fcf_yield > 0.08: # >8% 极度便宜
+                val_score += 20
+                self.logs.append(f"✅ **FCF Yield**: {format_percent(fcf_yield)} (现金奶牛!)")
+            elif fcf_yield > 0.04: # >4% 合理
+                val_score += 15
+                self.logs.append(f"☑️ **FCF Yield**: {format_percent(fcf_yield)} (合理回报)")
+            elif fcf_yield > 0.01:
+                val_score += 5
+                self.logs.append(f"⚠️ **FCF Yield**: {format_percent(fcf_yield)} (微薄回报)")
+            else:
+                val_score += 0
+                self.logs.append(f"❌ **FCF Yield**: {format_percent(fcf_yield)} (烧钱/太贵)")
+        
+        # EV/EBITDA 评分 (20分)
         if ev_ebitda:
-            if ev_ebitda < 15:
-                self.score += 3
-                analysis_log.append(f"✅ EV/EBITDA {ev_ebitda:.1f} 处于低位区间")
-            elif ev_ebitda > 25:
-                self.score -= 1
-                analysis_log.append(f"⚠️ EV/EBITDA {ev_ebitda:.1f} 处于高位区间")
+            # 简单粗暴的行业分位逻辑模拟
+            limit = 20 if "Tech" in sector else 12 # 科技股容忍度高
+            if ev_ebitda < limit:
+                val_score += 20
+                self.logs.append(f"✅ **EV/EBITDA**: {format_num(ev_ebitda)} (低于行业阈值 {limit})")
+            elif ev_ebitda < limit * 1.5:
+                val_score += 10
+                self.logs.append(f"☑️ **EV/EBITDA**: {format_num(ev_ebitda)} (中性)")
             else:
-                self.score += 1
-                analysis_log.append(f"☑️ EV/EBITDA 估值中性")
+                self.logs.append(f"❌ **EV/EBITDA**: {format_num(ev_ebitda)} (过热)")
 
-        # 3. 评判结论
-        if self.score >= 7:
-            self.verdict = "🟢 极度低估 (Deep Value)"
-        elif self.score >= 4:
-            self.verdict = "🔵 适度低估 (Undervalued)"
-        elif self.score >= 1:
-            self.verdict = "🟡 估值公允 (Fair Value)"
-        elif self.score >= -2:
-            self.verdict = "🟠 略微高估 (Overvalued)"
+        self.score += val_score
+
+        # ----------------------------------------------------
+        # 第三关：行业 Beta 校准与趋势 (Trend & Risk) - 权重: 20分
+        # ----------------------------------------------------
+        trend_score = 0
+        
+        # 1. 行业调整后 Beta
+        # 只有在防御性板块 Beta 还很高，或者科技板块 Beta 极高 (>2.0) 时才扣分
+        beta_threshold = 1.5 if "Tech" in sector else 1.0
+        risk_status = "正常"
+        
+        if beta and beta > beta_threshold + 0.5:
+            trend_score -= 5
+            risk_status = "高波动"
+            self.logs.append(f"⚠️ **Beta ({beta})**: 高于行业适宜水平 ({beta_threshold})")
+        elif beta and beta < 0.8:
+            trend_score += 5
+            risk_status = "低波动"
+            self.logs.append(f"✅ **Beta ({beta})**: 具备防御属性")
         else:
-            self.verdict = "🔴 严重高估 (Expensive)"
+            trend_score += 5
+            self.logs.append(f"☑️ **Beta ({beta})**: 行业范围内合理")
+
+        # 2. 200日均线趋势 (牛熊分界线)
+        sma200 = q.get("priceAvg200")
+        if sma200:
+            if price > sma200:
+                trend_score += 15
+                self.logs.append(f"📈 **技术面**: 价格 > 200日均线 (多头趋势)")
+            else:
+                self.logs.append(f"📉 **技术面**: 价格 < 200日均线 (空头趋势)")
+        
+        self.score += max(0, trend_score) # 保证不扣成负数
+
+        # ----------------------------------------------------
+        # 第四关：成长性 (Growth) - 权重: 20分
+        # ----------------------------------------------------
+        # 即使没有 Forward PE，我们可以看营收增长
+        rev_growth = m.get("revenueGrowthTTM")
+        
+        growth_score = 0
+        if rev_growth:
+            if rev_growth > 0.2: # >20%
+                growth_score = 20
+                self.logs.append(f"🚀 **营收增长**: {format_percent(rev_growth)} (高成长)")
+            elif rev_growth > 0.05:
+                growth_score = 10
+                self.logs.append(f"☑️ **营收增长**: {format_percent(rev_growth)} (稳健)")
+            elif rev_growth < 0:
+                self.logs.append(f"❌ **营收增长**: {format_percent(rev_growth)} (萎缩)")
+        
+        self.score += growth_score
+
+        # ----------------------------------------------------
+        # 最终裁决
+        # ----------------------------------------------------
+        # 如果有严重红牌，分数强制打折
+        if self.flags:
+            self.score = min(self.score, 59)
+            self.verdict = "🚩 存在硬伤 (Major Flags)"
+        elif self.score >= 80:
+            self.verdict = "🟢 强力买入 (Strong Buy)"
+        elif self.score >= 60:
+            self.verdict = "🔵 逢低吸纳 (Buy/Accumulate)"
+        elif self.score >= 40:
+            self.verdict = "🟡 观望/持有 (Hold)"
+        else:
+            self.verdict = "🔴 卖出/回避 (Sell/Avoid)"
 
         return {
-            "price": current_price,
-            "dcf": dcf_value,
-            "beta": beta,
-            "pe": pe,
-            "peg": peg,
+            "price": price,
+            "sma200": sma200,
+            "fcf_yield": fcf_yield,
             "ev_ebitda": ev_ebitda,
-            "logs": analysis_log,
-            "company_name": profile.get("companyName"),
-            "image": profile.get("image")
+            "sector": sector,
+            "beta": beta,
+            "flags": self.flags
         }
 
-# --- Bot 设置与 Slash Command ---
+# --- Bot Setup ---
 
-class ValuationBot(commands.Bot):
+class HardcoreBot(commands.Bot):
     def __init__(self):
-        # 设置 intents
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # 启动时同步 Slash 命令
-        # 注意：全局同步可能需要几分钟到1小时生效。
-        # 如果是私有服务器，可以使用 guild=discord.Object(id=YOUR_GUILD_ID) 进行秒级同步
-        print("正在同步 Slash 命令...")
+        print("Syncing commands...")
         await self.tree.sync()
-        print("Slash 命令同步完成！")
+        print("Commands synced.")
 
-bot = ValuationBot()
+bot = HardcoreBot()
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    print('------')
-
-# 定义 Slash Command
-@bot.tree.command(name="value", description="基于机构模型测算美股估值 (DCF/PEG/EBITDA)")
-@app_commands.describe(ticker="股票代码 (例如: NVDA, AAPL)")
-async def value(interaction: discord.Interaction, ticker: str):
-    # 1. 立即回复 "Thinking..." 避免超时
+@bot.tree.command(name="analyze", description="[硬核版] 机构级量化评分模型 (Quality + Value + Trend)")
+@app_commands.describe(ticker="股票代码 (e.g. MSFT)")
+async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
     
-    # 2. 调取数据
-    model = ValuationModel(ticker)
-    success = await model.fetch_all()
+    model = QuantAlphaModel(ticker)
+    success = await model.fetch_data()
     
     if not success:
-        # 使用 followup 发送结果
-        await interaction.followup.send(f"❌ 找不到代码 `{ticker.upper()}` 或 API 数据不可用。", ephemeral=True)
+        await interaction.followup.send(f"❌ 数据获取失败 `{ticker.upper()}`", ephemeral=True)
         return
 
-    result = model.calculate_valuation()
-    if not result:
-        await interaction.followup.send(f"⚠️ 数据解析失败，请稍后重试。", ephemeral=True)
+    data = model.analyze()
+    if not data:
+        await interaction.followup.send(f"⚠️ 数据不足以进行量化分析。", ephemeral=True)
         return
 
-    # 3. 构建 Embed
-    embed = discord.Embed(
-        title=f"📊 估值评测: {result['company_name']} ({ticker.upper()})",
-        description=f"**当前评价:** {model.verdict}\n基于 DCF、PEG 及 EV/EBITDA 多因子模型测算。",
-        color=0x00ff00 if model.score >= 4 else (0xff0000 if model.score < 0 else 0xffaa00)
-    )
+    # 颜色逻辑：根据分数变色
+    color = 0x2ecc71 if model.score >= 70 else (0xe74c3c if model.score < 40 else 0xf1c40f)
     
-    if result['image']:
-        embed.set_thumbnail(url=result['image'])
-
-    # 字段展示
-    embed.add_field(name="当前价格", value=f"${result['price']}", inline=True)
-    embed.add_field(name="内在价值 (DCF)", value=format_num(result['dcf'], True), inline=True)
-    embed.add_field(name="风险属性 (Beta)", value=f"{format_num(result['beta'])} \n{model.risk_tag}", inline=True)
-
-    metrics_str = (
-        f"**P/E (TTM):** {format_num(result['pe'])}\n"
-        f"**PEG Ratio:** {format_num(result['peg'])}\n"
-        f"**EV/EBITDA:** {format_num(result['ev_ebitda'])}"
+    embed = discord.Embed(
+        title=f"🛡️ 量化审计报告: {ticker.upper()}",
+        description=f"**所属板块:** {data['sector']}\n**当前价格:** ${data['price']}",
+        color=color
     )
-    embed.add_field(name="估值倍数 (TTM)", value=metrics_str, inline=False)
 
-    log_str = "\n".join(result['logs'])
-    embed.add_field(name="🔬 评测详情", value=f"```{log_str}```", inline=False)
+    # 1. 核心结论区
+    verdict_text = f"# {model.verdict}\n**综合评分: {model.score}/100**"
+    if model.flags:
+        verdict_text += "\n⚠️ **检测到重大财务风险，分数已强制修正**"
+    
+    embed.add_field(name="🏆 审计结论", value=verdict_text, inline=False)
 
-    embed.set_footer(text="Data: Financial Modeling Prep | 仅供参考")
+    # 2. 风险警报区 (如果有)
+    if model.flags:
+        flag_str = "\n".join(model.flags)
+        embed.add_field(name="🚩 风险警示 (RED FLAGS)", value=f"```{flag_str}```", inline=False)
 
-    # 4. 发送最终结果
+    # 3. 核心因子详情
+    # 将日志分为 "优势" 和 "劣势" 或者直接列出
+    log_str = "\n".join(model.logs)
+    embed.add_field(name="🧠 因子详细分析 (Factor Analysis)", value=f"```diff\n{log_str}\n```", inline=False)
+
+    # 4. 关键指标概览
+    metrics_str = (
+        f"**FCF Yield:** {format_percent(data['fcf_yield'])}\n"
+        f"**EV/EBITDA:** {format_num(data['ev_ebitda'])}\n"
+        f"**200日均线:** ${format_num(data['sma200'])}"
+    )
+    embed.add_field(name="📊 核心量化指标", value=metrics_str, inline=False)
+
+    embed.set_footer(text="Model: Quant Alpha v1.0 | Data: FMP Stable | 不构成投资建议")
+
     await interaction.followup.send(embed=embed)
 
-# 运行 Bot
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        print("Error: DISCORD_TOKEN environment variable not set.")
-    else:
-        bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
