@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.4 Text Polish) ---
+# --- 3. 估值判断模型 (v6.5 Layout Polish) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -208,12 +208,12 @@ class ValuationModel:
         
         # --- 短期估值逻辑 (含亏损熔断) ---
         
-        # [核心修复] 亏损熔断
+        # 亏损熔断
         is_distressed = False
         if (net_margin is not None and net_margin < -0.05) or (fcf_yield is not None and fcf_yield < -0.02):
             is_distressed = True
-            st_status = "极其昂贵" # [修改] 文案更直观
-            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效。") # [修改] 删掉废话
+            st_status = "极其昂贵"
+            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效。")
         
         if not is_distressed:
             if ev_ebitda is not None:
@@ -305,7 +305,6 @@ class ValuationModel:
             total = len(recent)
             beat_rate = beats / total
             
-            # [修改] 不显示具体日期，只显示结论
             if beat_rate >= 0.75:
                 self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
             else:
@@ -360,7 +359,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v6.4] 估值分析 (文案精修版)")
+@bot.tree.command(name="analyze", description="[v6.5] 估值分析 (视觉优化版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -405,9 +404,13 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         f"**PEG:** {peg_display} ({data['growth_desc']})\n"
         f"**Meme值:** {meme_pct}% ({meme_desc})"
     )
+    # [视觉优化] 插入空行
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
     if data['risk_var'] != "N/A":
+        # [视觉优化] 插入空行
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
         embed.add_field(name="95% VaR (月度风险)", value=f"最大回撤可能达 **{data['risk_var']}**", inline=False)
 
     log_content = []
@@ -418,6 +421,8 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     if log_content:
         log_str = "\n".join(log_content)
         if len(log_str) > 1000: log_str = log_str[:990] + "..."
+        # [视觉优化] 插入空行
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
         embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
 
     embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考")
