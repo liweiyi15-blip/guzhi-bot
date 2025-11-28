@@ -83,6 +83,7 @@ def fetch_dynamic_sector_pe_benchmark(sector):
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
+            # FMP 历史接口返回列表，默认取最新日期的数据
             if data and data[0].get("pe"):
                 median_value = data[0]["pe"]
                 logger.info(f"✅ Dynamic PE Median for {sector}: {median_value:.2f}")
@@ -93,6 +94,7 @@ def fetch_dynamic_sector_pe_benchmark(sector):
         logger.warning(f"⚠️ Failed to fetch dynamic PE median for {sector}. Error: {e}")
         return None
 
+# [修改] 回落函数：现在返回 PE Median
 def get_sector_benchmark(sector, dynamic_median=None):
     if dynamic_median is not None:
         return dynamic_median
@@ -103,7 +105,7 @@ def get_sector_benchmark(sector, dynamic_median=None):
         if key.lower() in str(sector).lower(): return value
     return 18.0
 
-# --- 3. 估值判断模型 (v7.0.2 Meme Update) ---
+# --- 3. 估值判断模型 (v7.0.3 UnboundLocalError Fix) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -176,7 +178,6 @@ class ValuationModel:
         
         if not p or not q: return None
 
-        # ... (数据提取和增长率计算逻辑不变) ...
         price = q.get("price")
         price_200ma = q.get("priceAvg200")
         vol_today = q.get("volume")
@@ -237,6 +238,7 @@ class ValuationModel:
             peg_status = "N/A"
             
         # --- 增长率计算 (依赖 PEG) ---
+
         implied_growth = 0
         if peg and pe and peg > 0:
             implied_growth = (pe / peg) / 100.0
@@ -250,7 +252,7 @@ class ValuationModel:
         elif max_growth > 0.05: growth_desc = "稳健"
         if peg and peg > 3.0: growth_desc = "高预期"
 
-        # VIX/风险计算 (不变)
+        # VIX/风险计算
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
@@ -260,9 +262,9 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 (不变) ---
+        # --- Meme/信仰值模型 ---
         meme_score = 0
-        # ... (Meme scoring logic remains the same) ...
+        
         # 1. 价格趋势
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
@@ -294,11 +296,11 @@ class ValuationModel:
         
         meme_score = max(0, min(10, meme_score))
         meme_pct = int(meme_score * 10)
-        is_faith_mode = meme_pct >= 50 # [修正] 触发阈值从 60% 降至 50%
+        is_faith_mode = meme_pct >= 50 # [修复] 触发阈值已降至 50%
 
         st_status = "估值合理"
         
-        # --- 短期估值逻辑 (不变) ---
+        # --- 短期估值逻辑 (使用 PE Median) ---
         is_distressed = False
         if (net_margin is not None and net_margin < -0.05) or (fcf_yield is not None and fcf_yield < -0.02):
             is_distressed = True
@@ -331,6 +333,7 @@ class ValuationModel:
         
         # --- 长期估值 ---
         lt_status = "中性"
+        is_value_trap = False # [修复] 确保初始化
 
         if net_margin is not None and net_margin < 0 and price_200ma and price < price_200ma:
             is_value_trap = True
@@ -492,7 +495,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
     meme_pct = data['meme_pct']
-    # [修正] 详细 Meme 描述 (50%+)
+    # 动态 Meme 描述
     if meme_pct >= 90: meme_desc = "极端狂热 (Meme 宇宙)"
     elif meme_pct >= 80: meme_desc = "高潮博弈 (纯情绪驱动)"
     elif meme_pct >= 70: meme_desc = "狂热资金流 (高位风险)"
@@ -535,7 +538,6 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         else:
             formatted_logs.append(log)
 
-    # [核心技巧] 构造连续竖线
     # 1. 对每一行内容加 Quote
     quoted_factors = [f"> {log}" for log in formatted_logs]
     # 2. 用带 Quote 的空行连接，保证竖线不断
