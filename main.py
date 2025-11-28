@@ -26,7 +26,7 @@ logger = logging.getLogger("ValuationBot")
 # --- 1. 数据工具函数 ---
 
 def get_fmp_data(endpoint, ticker, params=""):
-    # 隐藏 Key 用于日志
+    # 构造 URL
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     
@@ -40,6 +40,7 @@ def get_fmp_data(endpoint, ticker, params=""):
         
         data = response.json()
         
+        # FMP 通常返回列表，取最新的一个 [0]
         if isinstance(data, list):
             if len(data) > 0:
                 return data[0]
@@ -59,12 +60,12 @@ def format_num(num):
     return f"{num:.2f}"
 
 def format_market_cap(num):
-    if num is None: return "N/A"
+    if num is None or num == 0: return "N/A"
     if num >= 1e12: return f"${num/1e12:.2f}T (万亿)"
     if num >= 1e9: return f"${num/1e9:.2f}B (十亿)"
     return f"${num/1e6:.2f}M (百万)"
 
-# --- 2. 行业基准数据 (Sector Benchmarks) ---
+# --- 2. 行业基准数据 ---
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0,
     "Consumer Electronics": 25.0,
@@ -81,7 +82,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (Valuation Model) ---
+# --- 3. 估值判断模型 ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -101,6 +102,7 @@ class ValuationModel:
         tasks = {
             "profile": loop.run_in_executor(None, get_fmp_data, "profile", self.ticker, ""),
             "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
+            # 这里我们使用 key-metrics-ttm，但也兼容 key-metrics 的返回格式
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
@@ -114,7 +116,8 @@ class ValuationModel:
     def analyze(self):
         p = self.data.get("profile", {}) or {}
         q = self.data.get("quote", {}) or {}
-        m = self.data.get("metrics", {}) or {}
+        m = self.data.get("metrics", {}) or {} # 这是核心
+        r = self.data.get("ratios", {}) or {}
         bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
         
@@ -123,19 +126,43 @@ class ValuationModel:
         price = q.get("price")
         sector = p.get("sector", "Unknown")
         beta = p.get("beta", 1.0)
-        m_cap = p.get("mktCap", 0) # 获取市值
         
-        # --- 0. 市场情绪 (VIX Regime) ---
+        # --- 修复 1: 市值三重保险 (Quote -> Metrics -> Profile) ---
+        m_cap = q.get("marketCap")
+        if not m_cap or m_cap == 0:
+            m_cap = m.get("marketCap") # 从你提供的 metrics 接口里取
+        if not m_cap or m_cap == 0:
+            m_cap = p.get("mktCap", 0)
+
+        # --- 修复 2: EV/EBITDA 兼容性读取 ---
+        # 你的数据里 key 是 "evToEBITDA"，旧代码在找 "enterpriseValueOverEBITDATTM"
+        ev_ebitda = m.get("evToEBITDA") 
+        if ev_ebitda is None:
+            ev_ebitda = m.get("enterpriseValueOverEBITDATTM")
+        if ev_ebitda is None:
+            # 最后尝试去 ratios 里找
+            ev_ebitda = r.get("enterpriseValueMultipleTTM")
+
+        # --- 修复 3: FCF Yield 兼容性读取 ---
+        fcf_yield = m.get("freeCashFlowYield") # 你的数据 Key
+        if fcf_yield is None:
+            fcf_yield = m.get("freeCashFlowYieldTTM")
+
+        # --- 修复 4: ROIC 兼容性读取 ---
+        roic = m.get("returnOnInvestedCapital") # 你的数据 Key
+        if roic is None:
+            roic = m.get("returnOnInvestedCapitalTTM")
+
+        # --- 0. 市场情绪 ---
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"🟢 风平浪静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"🟡 市场震荡 (VIX {vix:.1f})"
         else: self.market_regime = f"🔴 恐慌模式 (VIX {vix:.1f})"
 
-        # --- 1. 短期估值 (相对行业) ---
-        ev_ebitda = m.get("enterpriseValueOverEBITDATTM")
+        # --- 1. 短期估值 ---
         sector_avg = get_sector_benchmark(sector)
-        
         st_status = "中性"
+        
         if ev_ebitda:
             ratio = ev_ebitda / sector_avg
             if ratio < 0.7:
@@ -146,18 +173,17 @@ class ValuationModel:
                 self.logs.append(f"⚡ 短期: EV/EBITDA {format_num(ev_ebitda)} vs 行业 {sector_avg} (溢价 {(ratio-1)*100:.0f}%)")
             else:
                 st_status = "🟡 中性 (Fair)"
-                self.logs.append(f"⚡ 短期: 估值与行业同步 ({format_num(ev_ebitda)}x)")
+                self.logs.append(f"⚡ 短期: 估值与行业同步")
+        else:
+            self.logs.append("⚠️ 短期: EV/EBITDA 数据暂缺")
         
         self.short_term_verdict = st_status
 
-        # --- 2. 长期估值 (FCF + Moat) ---
-        fcf_yield = m.get("freeCashFlowYieldTTM")
-        roic = m.get("returnOnInvestedCapitalTTM")
-        
-        # 债务审计
-        net_debt = m.get("netDebt")
+        # --- 2. 长期估值 ---
+        net_debt = m.get("netDebt") or m.get("netDebtToEBITDA") # 尝试获取
         total_assets = bs.get("totalAssets")
         debt_risk = False
+        # 简单判断: 如果有负债率数据
         if net_debt and total_assets and net_debt > total_assets * 0.6:
             debt_risk = True
 
@@ -166,7 +192,7 @@ class ValuationModel:
             if fcf_yield > 0.04:
                 if debt_risk:
                     lt_status = "🔴 价值陷阱"
-                    self.flags.append(f"⚠️ **高负债风险**: FCF Yield 高但负债重")
+                    self.flags.append(f"⚠️ **高负债风险**: 负债率过高")
                 else:
                     lt_status = "🟢 便宜 / 值得持有"
                     self.logs.append(f"⏳ 长期: FCF Yield {format_percent(fcf_yield)} 回报丰厚")
@@ -177,14 +203,11 @@ class ValuationModel:
                 lt_status = "🔴 贵 / 透支未来"
                 self.logs.append(f"⏳ 长期: FCF Yield {format_percent(fcf_yield)} 极低")
             
-            # 护城河
             if roic and roic > 0.15:
-                self.logs.append(f"🏰 **深护城河**: ROIC {format_percent(roic)} (高效率)")
+                self.logs.append(f"🏰 **深护城河**: ROIC {format_percent(roic)}")
                 if lt_status == "🟡 合理": lt_status = "🟢 优质合理"
 
         self.long_term_verdict = lt_status
-
-        # 这里不再设置 self.color，颜色将由 Embed 统一指定
 
         return {
             "price": price,
@@ -211,7 +234,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v1.6] 美股估值深度透视")
+@bot.tree.command(name="analyze", description="[v1.8] 美股估值深度透视")
 @app_commands.describe(ticker="股票代码 (e.g. NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -228,29 +251,25 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=True)
         return
 
-    # 统一使用 Discord 蓝 (Professional Blue)
     embed = discord.Embed(
         title=f"📊 深度透视: {ticker.upper()}",
         description=f"当前市场情绪: **{model.market_regime}**",
-        color=0x3498db # 固定蓝色
+        color=0x3498db
     )
 
-    # 1. 估值仪表盘
     verdict_text = (
         f"⚡ **短期 (vs 行业):** {model.short_term_verdict}\n"
         f"⏳ **长期 (vs 回报):** {model.long_term_verdict}"
     )
     embed.add_field(name="🎯 估值判定", value=verdict_text, inline=False)
 
-    # 2. 基础数据 (新增市值)
     base_info = (
         f"**价格:** ${data['price']}\n"
-        f"**市值:** {format_market_cap(data['m_cap'])}\n" # 显示市值
+        f"**市值:** {format_market_cap(data['m_cap'])}\n"
         f"**板块:** {data['sector']}"
     )
     embed.add_field(name="📋 基础信息", value=base_info, inline=True)
 
-    # 3. 核心因子
     metric_text = f"**EV/EBITDA:** {format_num(data['ev_ebitda'])}\n"
     metric_text += f"**FCF Yield:** {format_percent(data['fcf_yield'])}\n"
     if data['roic'] and data['roic'] > 0.15:
@@ -260,18 +279,15 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         
     embed.add_field(name="🔑 核心因子", value=metric_text, inline=True)
 
-    # 4. 风险因子
     beta_val = data['beta']
     beta_desc = "🛡️ 低波" if beta_val < 0.8 else ("🔥 高波" if beta_val > 1.3 else "⚖️ 适中")
     embed.add_field(name="🌊 Beta", value=f"{format_num(beta_val)} ({beta_desc})", inline=True)
 
-    # 5. 逻辑日志
     log_str = "\n".join(model.logs)
     if model.flags:
         log_str += "\n" + "\n".join(model.flags)
     embed.add_field(name="🧠 模型思考", value=f"```diff\n{log_str}\n```", inline=False)
 
-    # 6. Beta 脚注
     beta_footnote = "Beta > 1.3 为进攻型 (高波)；Beta < 0.8 为防御型 (低波)。"
     embed.add_field(name="ℹ️ Note", value=beta_footnote, inline=False)
 
