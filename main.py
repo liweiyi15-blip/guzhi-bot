@@ -26,49 +26,33 @@ logger = logging.getLogger("ValuationBot")
 # --- 1. 数据工具函数 ---
 
 def get_fmp_data(endpoint, ticker, params=""):
-    """
-    通用请求: /endpoint?symbol=TICKER
-    """
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     
     try:
         logger.info(f"📡 Requesting: {safe_url}")
         response = requests.get(url, timeout=10)
-        if response.status_code != 200: 
-            logger.error(f"❌ API Error {response.status_code} for {endpoint}")
-            return None
+        if response.status_code != 200: return None
         data = response.json()
-        if isinstance(data, list) and "historical" not in endpoint:
+        
+        # 兼容性处理
+        if isinstance(data, list) and "earnings" not in endpoint:
             if len(data) > 0: return data[0]
-            else: 
-                logger.warning(f"⚠️ Empty list returned for {endpoint}")
-                return None
+            else: return None
         return data
-    except Exception as e:
-        logger.error(f"❌ Exception fetching {endpoint}: {e}")
-        return None
+    except: return None
 
-def get_fmp_list_data(endpoint, ticker, limit=4):
+def get_earnings_data(ticker):
     """
-    [修复] 列表请求现在也强制使用 ?symbol=TICKER 格式
-    这解决了 earnings-surprises 在 stable 接口下的 404 问题
+    [核心修复] 使用 stable/earnings 接口，并获取足够的历史数据进行清洗
     """
-    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&limit={limit}"
-    safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&limit={limit}"
-    
+    # 这里的 limit 设置大一点(比如20)，因为前几个可能是未来的预测数据
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=20"
     try:
-        logger.info(f"📡 Requesting List: {safe_url}")
         response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200: 
-            logger.error(f"❌ API Error {response.status_code} for list {endpoint}")
-            return []
-        
+        if response.status_code != 200: return []
         return response.json()
-    except Exception as e:
-        logger.error(f"❌ Exception fetching list {endpoint}: {e}")
-        return []
+    except: return []
 
 def format_percent(num):
     if num is None: return "N/A"
@@ -96,7 +80,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v3.5) ---
+# --- 3. 估值判断模型 (v3.8) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -122,11 +106,11 @@ class ValuationModel:
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
-            "earnings": loop.run_in_executor(None, get_fmp_list_data, "earnings-surprises", self.ticker, 8)
+            # 改用 get_earnings_data
+            "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
         }
         results = await asyncio.gather(*tasks.values())
         self.data = dict(zip(tasks.keys(), results))
-        
         return self.data["profile"] is not None and self.data["quote"] is not None
 
     def analyze(self):
@@ -136,7 +120,7 @@ class ValuationModel:
         r = self.data.get("ratios", {}) or {}
         bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
-        earnings = self.data.get("earnings", []) or []
+        raw_earnings = self.data.get("earnings", []) or []
         
         if not p or not q: return None
 
@@ -157,19 +141,6 @@ class ValuationModel:
         ni_growth = m.get("netIncomeGrowthTTM")
         rev_growth = m.get("revenueGrowthTTM")
 
-        # 后台审计
-        missing_fields = []
-        if not m_cap: missing_fields.append("Market Cap")
-        if not ev_ebitda: missing_fields.append("EV/EBITDA")
-        if not fcf_yield: missing_fields.append("FCF Yield")
-        if not roic: missing_fields.append("ROIC")
-        if not earnings: missing_fields.append("Earnings Surprises")
-        
-        if missing_fields:
-            logger.warning(f"⚠️ [DATA MISSING] {self.ticker}: {', '.join(missing_fields)}")
-        else:
-            logger.info(f"✅ [DATA HEALTHY] {self.ticker}")
-
         if peg is None and pe and ni_growth and ni_growth > 0:
             try: peg = pe / (ni_growth * 100)
             except: pass
@@ -179,20 +150,24 @@ class ValuationModel:
             implied_growth = (pe / peg) / 100.0
 
         max_growth = max(filter(None, [rev_growth, ni_growth, implied_growth])) if any([rev_growth, ni_growth, implied_growth]) else 0
+        
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
         elif max_growth > 0.2: growth_desc = "高速"
         elif max_growth > 0.05: growth_desc = "稳健"
 
+        # --- 0. 市场情绪 ---
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
         else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
+        # --- 1. 风险量化 ---
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
+        # --- 2. 短期估值 ---
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
@@ -219,6 +194,7 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
+        # --- 3. 长期估值与策略 ---
         lt_status = "中性"
         is_value_trap = False
 
@@ -255,18 +231,33 @@ class ValuationModel:
             if not fcf_yield:
                 self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        if not is_value_trap and earnings and isinstance(earnings, list):
-            beats = 0
-            total = 0
-            for e in earnings:
-                est = e.get("estimatedEarning")
-                act = e.get("actualEarningResult")
+        # D. Alpha 信号 (核心数据清洗逻辑)
+        # ------------------------------------------------------------------
+        valid_earnings = []
+        if isinstance(raw_earnings, list):
+            for e in raw_earnings:
+                # 兼容多种字段名
+                est = e.get("epsEstimated") or e.get("estimatedEarning")
+                act = e.get("epsActual") or e.get("eps") or e.get("actualEarningResult")
+                
+                # [核心修复] 只保留已经发生的财报 (act 不为 None)
                 if est is not None and act is not None:
-                    total += 1
-                    if act > est: beats += 1
+                    valid_earnings.append({"est": est, "act": act})
+        
+        # 确保数据是按时间倒序排列的(通常API默认是倒序)，取最近4次
+        recent_earnings = valid_earnings[:4]
+        
+        if len(recent_earnings) >= 4:
+            beats = 0
+            for item in recent_earnings:
+                if item["act"] > item["est"]:
+                    beats += 1
             
-            if total >= 4 and beats / total >= 0.85:
-                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次超预期，机构主力控盘稳健。")
+            beat_rate = beats / len(recent_earnings)
+            # 只有胜率很高才作为 Alpha 因子输出
+            if beat_rate >= 0.75: 
+                self.logs.append(f"[Alpha] 过去 4 个有效季度中有 {beats} 次超预期，机构主力控盘稳健。")
+        # ------------------------------------------------------------------
 
         self.long_term_verdict = lt_status
 
@@ -295,7 +286,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v3.5] 估值分析 (格式修复版)")
+@bot.tree.command(name="analyze", description="[v3.8] 估值分析 (数据清洗终极版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
