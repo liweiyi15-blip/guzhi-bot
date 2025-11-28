@@ -48,12 +48,10 @@ def get_fmp_list_data(endpoint, ticker, limit=4):
     except: return []
 
 def format_percent(num):
-    if num is None: return "N/A"
-    return f"{num * 100:.2f}%"
+    return f"{num * 100:.2f}%" if num is not None else "N/A"
 
 def format_num(num):
-    if num is None: return "N/A"
-    return f"{num:.2f}"
+    return f"{num:.2f}" if num is not None else "N/A"
 
 def format_market_cap(num):
     if num is None or num == 0: return "N/A"
@@ -73,7 +71,7 @@ def get_sector_benchmark(sector):
         if key in str(sector): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v4.4) ---
+# --- 3. 估值判断模型 (v4.9) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -124,6 +122,7 @@ class ValuationModel:
         fcf_yield = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM")
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
+        ps_ratio = r.get("priceToSalesRatioTTM")
         
         # PEG
         peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
@@ -145,9 +144,7 @@ class ValuationModel:
         if max_growth > 0.5: growth_desc = "超高速"
         elif max_growth > 0.2: growth_desc = "高速"
         elif max_growth > 0.05: growth_desc = "稳健"
-        
-        # PEG > 3.0 标记为高预期/动量
-        if peg and peg > 3.0: growth_desc = "高预期/动量"
+        if peg and peg > 3.0: growth_desc = "高预期"
 
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
@@ -158,30 +155,55 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # =========================================================
-        # 🔥 信仰/脱锚检测
-        # =========================================================
+        # ==============================================================================
+        # 🔥 v4.9 信仰资产终极识别器 (The Faith Detector)
+        # ==============================================================================
         faith_score = 0
-        if (ev_ebitda and ev_ebitda > 80) or (pe and pe > 100): faith_score += 3
-        if price and price_200ma and price > price_200ma * 1.3: faith_score += 3
-        if beta and beta > 1.5: faith_score += 2
+        faith_type = "无" # 轻度信仰 / 重度宗教
 
+        # 1. 散户/波动率因子 (Beta > 2.0 说明散户控盘度极高)
+        if beta and beta > 2.0:
+            faith_score += 2
+        
+        # 2. 逼空/动量因子 (股价严重偏离年线 > 50%)
+        if price and price_200ma and price > price_200ma * 1.5:
+            faith_score += 3
+        
+        # 3. 估值泡沫因子 (市销率 P/S > 25 或 EV/EBITDA > 80)
+        if (ps_ratio and ps_ratio > 25) or (ev_ebitda and ev_ebitda > 80):
+            faith_score += 2
+
+        # 4. 业绩证伪因子 (关键！保护 NVDA 不被误伤)
+        # 如果公司 ROIC < 5% (甚至为负)，说明根本不赚钱，纯炒作 -> 加分
+        # 如果公司 ROIC > 20%，说明是真成长 (如 NVDA) -> 倒扣分，豁免信仰判定
+        if roic:
+            if roic < 0.05: # 垃圾业绩
+                faith_score += 3
+            elif roic > 0.20: # 顶级业绩 (NVDA Shield)
+                faith_score -= 5 
+
+        # 判定
+        if faith_score >= 7:
+            faith_type = "重度宗教 (Meme)"
+        elif faith_score >= 5:
+            faith_type = "轻度信仰"
+        
         is_faith_mode = faith_score >= 5
-        # =========================================================
+        # ==============================================================================
 
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
         if ev_ebitda:
             ratio = ev_ebitda / sector_avg
-            if ("高速" in growth_desc or "动量" in growth_desc) and peg and peg < 1.5:
+            if ("高速" in growth_desc or "预期" in growth_desc) and peg and peg < 1.5:
                 st_status = "便宜 (高成长)"
                 self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
             elif ratio < 0.7:
                 st_status = "便宜"
                 self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
             elif ratio > 1.3:
-                if ("高速" in growth_desc or "动量" in growth_desc) and peg and peg < 2.0:
+                if ("高速" in growth_desc or "预期" in growth_desc) and peg and peg < 2.0:
                      st_status = "合理溢价"
                      self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
                 else:
@@ -195,7 +217,7 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 3. 长期估值与策略 ---
+        # --- 长期估值与策略 ---
         lt_status = "中性"
         is_value_trap = False
 
@@ -207,18 +229,22 @@ class ValuationModel:
             self.strategy = "趋势与基本面双弱，需警惕'接飞刀'风险"
         
         if not is_value_trap:
-            # 信仰模式：这里是你要求的修改点
+            # --- 信仰模式接管 ---
             if is_faith_mode:
-                self.logs.insert(0, f"[信仰] 股价强势运行于年线之上，散户狂热叠加机构抱团，做多情绪已凝聚成强烈的“资金共识”。")
-                if "昂贵" in st_status:
-                    st_status += " / 资金博弈"
-                if "昂贵" in lt_status:
-                    lt_status = "高溢价 (信仰支撑)"
-                
-                self.strategy = "基本面包含极高预期，但资金动量主导短期走势。顺势交易需严设止损。"
+                if faith_type == "重度宗教 (Meme)":
+                    self.logs.insert(0, f"[信仰] 触发重度信仰资产判定：基本面脱锚，完全由资金博弈和散户共识主导。")
+                    st_status = "资金博弈"
+                    lt_status = "脱离引力"
+                    self.strategy = "这已不是投资而是博弈。切勿左侧做空，持仓者需紧盯流动性，严设止损。"
+                else: # 轻度
+                    self.logs.insert(0, f"[动量] 估值包含极高溢价，市场正在交易未来的宏大叙事。")
+                    st_status += " / 情绪溢价"
+                    lt_status = "高预期"
+                    self.strategy = "基本面包含极高预期，动量主导短期走势。顺势交易需严设止损。"
 
+            # --- 常规逻辑 ---
             if fcf_yield:
-                # A: 优质溢价
+                # A: 优质溢价 (NVDA)
                 if fcf_yield < 0.025 and roic and roic > 0.20:
                     if not is_faith_mode:
                         lt_status = "优质/值得等待"
@@ -291,8 +317,8 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v4.4] 估值分析 (散户信仰版)")
-@app_commands.describe(ticker="股票代码 (如 PLTR)")
+@bot.tree.command(name="analyze", description="[v4.9] 估值分析 (信仰识别终极版)")
+@app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
     
