@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.6 Final Logic) ---
+# --- 3. 估值判断模型 (v6.7 iOS Quotes) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -358,7 +358,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="估值分析") # [修改] 简洁文案
+@bot.tree.command(name="analyze", description="估值分析")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -382,14 +382,14 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         color=0x2b2d31
     )
 
-    # [排版] 估值结论：引用块 >
+    # [排版] 估值结论：使用 Quote Block
     verdict_text = (
         f"> **短期:** {model.short_term_verdict}\n"
         f"> **长期:** {model.long_term_verdict}"
     )
     embed.add_field(name="估值结论", value=verdict_text, inline=False)
 
-    # [排版] 核心数据：行内代码块 ` `
+    # [排版] 核心数据：每一行使用 Quote Block
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
@@ -401,33 +401,44 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     elif meme_pct >= 30: meme_desc = "机构共识"
     
     core_factors = (
-        f"**Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
-        f"**PEG:** `{peg_display}` ({data['growth_desc']})\n"
-        f"**Meme:** `{meme_pct}%` ({meme_desc})\n"
-        f"**Risk:** 最大回撤 `{data['risk_var']}`"
+        f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
+        f"> **PEG:** `{peg_display}` ({data['growth_desc']})\n"
+        f"> **Meme:** `{meme_pct}%` ({meme_desc})"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
-    # [排版] 因子分析：加粗Tag + 双换行符
+    # [排版] Risk 字段：恢复单独显示，内容加 Quote
+    if data['risk_var'] != "N/A":
+        embed.add_field(
+            name="95% VaR (月度风险)", 
+            value=f"> 最大回撤可能达 **{data['risk_var']}**", 
+            inline=False
+        )
+
+    # [排版] 因子分析：每一条都使用 Quote Block
     log_content = []
     if model.flags: log_content.extend(model.flags) 
     log_content.extend([f"{log}" for log in model.logs])
     
-    strategy_text = f"\n**[策略]** {model.strategy}"
+    strategy_text = f"**[策略]** {model.strategy}"
     
     formatted_logs = []
     for log in log_content:
-        # [板块] -> **[板块]**
+        # 标签加粗
         if log.startswith("[") and "]" in log:
             tag_end = log.find("]") + 1
             tag = log[:tag_end]
             content = log[tag_end:]
-            formatted_logs.append(f"**{tag}**{content}")
+            # 整个条目加 Quote > 
+            formatted_logs.append(f"> **{tag}**{content}")
         else:
-            formatted_logs.append(log)
+            formatted_logs.append(f"> {log}")
 
+    # 使用双换行 \n\n 连接，确保 iOS 上显示为独立块
     log_str = "\n\n".join(formatted_logs)
-    log_str += f"\n{strategy_text}"
+    
+    # 策略单独加一个空行后再引用
+    log_str += f"\n\n> {strategy_text}"
     
     if len(log_str) > 1000: log_str = log_str[:990] + "..."
 
