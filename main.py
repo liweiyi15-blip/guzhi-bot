@@ -39,12 +39,12 @@ def get_fmp_data(endpoint, ticker, params=""):
         return data
     except: return None
 
-def get_fmp_list_data(endpoint, ticker, limit=4):
-    url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}&limit={limit}"
+# [重要修复] 使用 v3 历史日历接口，防止 404
+def get_earnings_data(ticker):
+    url = f"{V3_URL}/historical/earning_calendar/{ticker}?limit=20&apikey={FMP_API_KEY}"
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code != 200: return []
-        return response.json()
+        return response.json() if response.status_code == 200 else []
     except: return []
 
 def format_percent(num):
@@ -71,7 +71,7 @@ def get_sector_benchmark(sector):
         if key in str(sector): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v4.9) ---
+# --- 3. 估值判断模型 (v5.0 修复版) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -95,7 +95,8 @@ class ValuationModel:
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
-            "earnings": loop.run_in_executor(None, get_fmp_list_data, "earnings-surprises", self.ticker, 8)
+            # [修复] 恢复使用 get_earnings_data 函数
+            "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
         }
         results = await asyncio.gather(*tasks.values())
         self.data = dict(zip(tasks.keys(), results))
@@ -108,7 +109,8 @@ class ValuationModel:
         r = self.data.get("ratios", {}) or {}
         bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
-        raw_earnings = self.data.get("earnings", []) or []
+        # [修复] 变量名统一为 earnings
+        earnings = self.data.get("earnings", []) or []
         
         if not p or not q: return None
 
@@ -156,37 +158,32 @@ class ValuationModel:
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
         # ==============================================================================
-        # 🔥 v4.9 信仰资产终极识别器 (The Faith Detector)
+        # 🔥 信仰资产识别器 (Faith Detector)
         # ==============================================================================
         faith_score = 0
-        faith_type = "无" # 轻度信仰 / 重度宗教
+        faith_type = "无"
 
-        # 1. 散户/波动率因子 (Beta > 2.0 说明散户控盘度极高)
+        # 1. 散户/波动率因子
         if beta and beta > 2.0:
             faith_score += 2
         
-        # 2. 逼空/动量因子 (股价严重偏离年线 > 50%)
+        # 2. 逼空/动量因子
         if price and price_200ma and price > price_200ma * 1.5:
             faith_score += 3
         
-        # 3. 估值泡沫因子 (市销率 P/S > 25 或 EV/EBITDA > 80)
+        # 3. 估值泡沫因子
         if (ps_ratio and ps_ratio > 25) or (ev_ebitda and ev_ebitda > 80):
             faith_score += 2
 
-        # 4. 业绩证伪因子 (关键！保护 NVDA 不被误伤)
-        # 如果公司 ROIC < 5% (甚至为负)，说明根本不赚钱，纯炒作 -> 加分
-        # 如果公司 ROIC > 20%，说明是真成长 (如 NVDA) -> 倒扣分，豁免信仰判定
+        # 4. 业绩证伪因子
         if roic:
-            if roic < 0.05: # 垃圾业绩
+            if roic < 0.05: # 垃圾业绩，加分
                 faith_score += 3
-            elif roic > 0.20: # 顶级业绩 (NVDA Shield)
+            elif roic > 0.20: # 顶级业绩 (NVDA Shield)，扣分豁免
                 faith_score -= 5 
 
-        # 判定
-        if faith_score >= 7:
-            faith_type = "重度宗教 (Meme)"
-        elif faith_score >= 5:
-            faith_type = "轻度信仰"
+        if faith_score >= 7: faith_type = "重度"
+        elif faith_score >= 5: faith_type = "轻度"
         
         is_faith_mode = faith_score >= 5
         # ==============================================================================
@@ -229,22 +226,22 @@ class ValuationModel:
             self.strategy = "趋势与基本面双弱，需警惕'接飞刀'风险"
         
         if not is_value_trap:
-            # --- 信仰模式接管 ---
+            # 信仰模式覆盖
             if is_faith_mode:
-                if faith_type == "重度宗教 (Meme)":
-                    self.logs.insert(0, f"[信仰] 触发重度信仰资产判定：基本面脱锚，完全由资金博弈和散户共识主导。")
+                if faith_type == "重度":
+                    self.logs.insert(0, f"[信仰] 触发重度信仰判定：基本面脱锚，完全由资金博弈和散户共识主导。")
                     st_status = "资金博弈"
                     lt_status = "脱离引力"
                     self.strategy = "这已不是投资而是博弈。切勿左侧做空，持仓者需紧盯流动性，严设止损。"
                 else: # 轻度
-                    self.logs.insert(0, f"[动量] 估值包含极高溢价，市场正在交易未来的宏大叙事。")
-                    st_status += " / 情绪溢价"
-                    lt_status = "高预期"
-                    self.strategy = "基本面包含极高预期，动量主导短期走势。顺势交易需严设止损。"
+                    self.logs.insert(0, f"[信仰] 股价强势运行于年线之上，散户狂热叠加机构抱团，做多情绪已凝聚成强烈的“资金共识”。")
+                    st_status += " / 资金博弈"
+                    lt_status = "高溢价 (信仰支撑)"
+                    self.strategy = "基本面包含极高预期，但资金动量主导短期走势。顺势交易需严设止损。"
 
-            # --- 常规逻辑 ---
+            # 常规逻辑
             if fcf_yield:
-                # A: 优质溢价 (NVDA)
+                # A: 优质溢价
                 if fcf_yield < 0.025 and roic and roic > 0.20:
                     if not is_faith_mode:
                         lt_status = "优质/值得等待"
@@ -274,11 +271,13 @@ class ValuationModel:
             if not fcf_yield:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
+        # D. Alpha 信号 [修复点：使用清洗后的数据]
         if not is_value_trap and earnings and isinstance(earnings, list):
             valid_earnings = []
             for e in earnings:
-                est = e.get("epsEstimated") or e.get("estimatedEarning")
-                act = e.get("epsActual") or e.get("eps") or e.get("actualEarningResult")
+                # 兼容 V3 接口字段
+                est = e.get("epsEstimated")
+                act = e.get("epsActual")
                 if est is not None and act is not None:
                     valid_earnings.append({"est": est, "act": act})
             
@@ -286,6 +285,7 @@ class ValuationModel:
             if len(recent) > 0:
                 beats = sum(1 for x in recent if x["act"] > x["est"])
                 total = len(recent)
+                # 防止除以零
                 beat_rate = beats / total
                 if beat_rate >= 0.75:
                     self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
@@ -317,7 +317,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v4.9] 估值分析 (信仰识别终极版)")
+@bot.tree.command(name="analyze", description="[v5.0] 估值分析 (稳定修复版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
