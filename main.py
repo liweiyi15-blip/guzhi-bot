@@ -96,8 +96,7 @@ class ValuationModel:
         self.flags = []  
         self.strategy = "数据不足"  
         self.fcf_yield_display = "N/A" 
-        # 存储原始 FCF Yield 用于比较
-        self.fcf_yield_api = None
+        self.fcf_yield_api = None # 存储原始 FCF Yield
 
     async def fetch_data(self):
         """异步获取所有 FMP 数据 (现金流量表 limit=4)"""
@@ -287,12 +286,14 @@ class ValuationModel:
         
         if not is_value_trap:
             
-            # *** PEG 显式分析 ***
+            # *** 新增: PEG 显式分析 (修正描述) ***
             if peg is not None and peg > 0:
                 if peg < 0.8:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于低位，暗示市场低估了公司的未来成长潜力。")
                 elif peg > 2.5:
-                    self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 较高，表明市场对未来成长的预期溢价已处于较高水平。")
+                    # *** 修正后的描述 ***
+                    self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 较高，意味着当前的股价已经包含了**极高的未来增长预期**。")
+                    # *** 修正后的描述结束 ***
                 elif 0.8 <= peg <= 2.5:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
             elif peg is not None and peg <= 0 and ni_growth is not None and ni_growth < 0:
@@ -338,20 +339,15 @@ class ValuationModel:
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 if is_adj_fcf_successful:
-                    # 修正成功，执行合并判断和日志记录
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
-                        # 修正后为“便宜” (>4.0%)：合并修正和价值判断日志
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > self.fcf_yield_api:
-                        # 修正后虽然不便宜，但向上修正：仅记录修正积极影响
-                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
+                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
                     elif adj_fcf_yield < self.fcf_yield_api:
-                        # 修正后向下修正：记录修正影响
                         self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(self.fcf_yield_api)})。")
                 elif fcf_yield_api is not None:
-                     # 修正失败：记录失败提示
                      self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
                 # *** 修正状态记录结束 ***
 
@@ -441,7 +437,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup (核心特征精简) ---
+# --- 4. Bot Setup (核心特征显示修正) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -497,7 +493,11 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     elif meme_pct >= 60: meme_desc = "高流动性"
     elif meme_pct >= 30: meme_desc = "市场关注"
     
-    # *** 核心特征精简 ***
+    # 确定显示标签是 Adjusted FCF Yield 还是 FCF Yield
+    # 比较 fcf_yield_display 是否是 Adjusted FCF Yield 的结果
+    api_fcf_formatted = format_percent(model.fcf_yield_api)
+    fcf_label = "Adj FCF Yield" if model.fcf_yield_display != api_fcf_formatted else "FCF Yield (原始)"
+    
     core_factors = (
         f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
         f"> **Meme值:** `{meme_pct}%` ({meme_desc})"
