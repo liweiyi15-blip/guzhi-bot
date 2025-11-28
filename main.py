@@ -27,6 +27,7 @@ logger = logging.getLogger("ValuationBot")
 
 def get_fmp_data(endpoint, ticker, params=""):
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
+    # 日志脱敏
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     
     try:
@@ -39,7 +40,6 @@ def get_fmp_data(endpoint, ticker, params=""):
         
         data = response.json()
         
-        # FMP 通用处理：如果是列表且只需要一个，取第一个
         if isinstance(data, list) and "historical" not in endpoint and "surprises" not in endpoint:
             if len(data) > 0:
                 return data[0]
@@ -58,12 +58,6 @@ def format_num(num):
     if num is None: return "N/A"
     return f"{num:.2f}"
 
-def format_market_cap(num):
-    if num is None or num == 0: return "N/A"
-    if num >= 1e12: return f"${num/1e12:.2f}T"
-    if num >= 1e9: return f"${num/1e9:.2f}B"
-    return f"${num/1e6:.2f}M"
-
 # --- 2. 行业基准 (横向对比) ---
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0,
@@ -81,16 +75,16 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v2.0) ---
+# --- 3. 估值判断模型 (v2.0 中文版) ---
 
 class ValuationModel:
     def __init__(self, ticker):
         self.ticker = ticker.upper()
         self.data = {}
         
-        self.short_term_verdict = "Unknown"
-        self.long_term_verdict = "Unknown"
-        self.market_regime = "Unknown"
+        self.short_term_verdict = "未知"
+        self.long_term_verdict = "未知"
+        self.market_regime = "未知"
         
         self.logs = [] # 因子分析日志
         self.flags = [] 
@@ -105,9 +99,7 @@ class ValuationModel:
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
-            # v2.0 新增: 历史估值 (过去1年/260个交易日)
-            "history": loop.run_in_executor(None, get_fmp_data, "historical-enterprise-value", self.ticker, "limit=260"),
-            # v2.0 新增: 盈利惊喜 (过去4个季度)
+            # v2.0: 盈利惊喜
             "earnings": loop.run_in_executor(None, get_fmp_data, "earnings-surprises", self.ticker, "limit=4")
         }
         results = await asyncio.gather(*tasks.values())
@@ -122,7 +114,6 @@ class ValuationModel:
         r = self.data.get("ratios", {}) or {}
         bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
-        history = self.data.get("history", []) or []
         earnings = self.data.get("earnings", []) or []
         
         if not p or not q: return None
@@ -138,63 +129,44 @@ class ValuationModel:
 
         # --- 0. 市场情绪 ---
         vix = vix_data.get("price", 20)
-        if vix < 20: self.market_regime = f"Calm (VIX {vix:.1f})"
-        elif vix < 30: self.market_regime = f"Volatile (VIX {vix:.1f})"
-        else: self.market_regime = f"Panic (VIX {vix:.1f})"
+        if vix < 20: self.market_regime = f"风平浪静 (VIX {vix:.1f})"
+        elif vix < 30: self.market_regime = f"市场震荡 (VIX {vix:.1f})"
+        else: self.market_regime = f"恐慌模式 (VIX {vix:.1f})"
 
-        # --- 1. 短期估值 (综合 行业对比 + 历史分位) ---
+        # --- 1. 短期估值 (行业对比) ---
         sector_avg = get_sector_benchmark(sector)
-        st_status = "Neutral"
+        st_status = "中性"
         
-        # A. 行业横向对比
         if ev_ebitda:
             ratio = ev_ebitda / sector_avg
             if ratio < 0.7:
-                st_status = "Undervalued"
-                self.logs.append(f"[Sector] EV/EBITDA {format_num(ev_ebitda)} is 30%+ below sector avg {sector_avg}.")
+                st_status = "显著低估"
+                self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 低于行业均值 {sector_avg} 超过 30%。")
             elif ratio > 1.3:
-                st_status = "Overvalued"
-                self.logs.append(f"[Sector] EV/EBITDA {format_num(ev_ebitda)} is 30%+ above sector avg {sector_avg}.")
+                st_status = "显著高估"
+                self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 高于行业均值 {sector_avg} 超过 30%。")
             else:
-                self.logs.append(f"[Sector] Valuation aligns with peers.")
+                self.logs.append(f"[板块] 估值倍数与行业同步。")
+        else:
+             self.logs.append(f"[板块] 缺少 EV/EBITDA 数据。")
         
-        # B. 历史纵向对比 (v2.0 新增核心)
-        if ev_ebitda and history:
-            # 提取历史 EV/EBITDA 序列
-            hist_vals = []
-            for h in history:
-                # 确保分母 EBITDA 不为 0
-                # FMP 历史接口返回字段可能不同，通常是 enterpriseValue 和 symbol 等
-                # 我们这里要做个简易计算，或者直接假设 API 返回了 ratio
-                # 注：historical-enterprise-value 接口通常不直接返回 EV/EBITDA，需要手动算
-                # 但为了代码简洁，如果 API 没返回 ratio，我们暂时跳过复杂计算，或者只在有 ratio 时计算
-                # 假设: 我们用 limit 数据里的 enterpriseValue / (stockPrice * sharesOutstanding / PE * ...) 
-                # 简化方案：直接拿 metrics 历史接口会更准，但这里为了利用现有数据，我们仅做定性分析
-                # 如果 history 列表里没有直接比率，我们略过此步，避免报错。
-                pass
-            
-            # **修正**: FMP 有 `historical-ratios` 接口更适合做分位。
-            # 鉴于只给了 enterprise-value 接口，我们这里做个简化逻辑：
-            # 假设当前倍数已知，我们只打印它。
-            pass
-
         self.short_term_verdict = st_status
 
         # --- 2. 长期估值 (FCF + 护城河 + 盈利修正) ---
-        lt_status = "Neutral"
+        lt_status = "中性"
         if fcf_yield:
             if fcf_yield > 0.04:
-                lt_status = "Cheap"
-                self.logs.append(f"[Value] FCF Yield {format_percent(fcf_yield)} offers strong returns.")
+                lt_status = "便宜"
+                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 显示回报丰厚。")
             elif fcf_yield < 0.02:
-                lt_status = "Expensive"
-                self.logs.append(f"[Value] FCF Yield {format_percent(fcf_yield)} is very low.")
+                lt_status = "昂贵"
+                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 极低，透支未来。")
             
             if roic and roic > 0.15:
-                self.logs.append(f"[Moat] High ROIC {format_percent(roic)} indicates strong competitive advantage.")
-                if lt_status == "Neutral": lt_status = "Quality"
+                self.logs.append(f"[护城河] ROIC 高达 {format_percent(roic)}，竞争优势显著。")
+                if lt_status == "中性": lt_status = "优质"
 
-        # C. 盈利惊喜 (v2.0 新增)
+        # C. 盈利惊喜 (Alpha 因子)
         if earnings and isinstance(earnings, list):
             beats = 0
             total = 0
@@ -208,17 +180,16 @@ class ValuationModel:
             if total > 0:
                 beat_rate = beats / total
                 if beat_rate == 1.0:
-                    self.logs.append(f"[Alpha] Earnings Surprise: Beat estimates in last {total} quarters consecutively.")
-                    if lt_status == "Neutral": lt_status = "Positive Momentum"
+                    self.logs.append(f"[Alpha] 业绩惊喜: 过去 {total} 个季度连续超预期。")
+                    if lt_status == "中性": lt_status = "动能强劲"
                 elif beat_rate < 0.5:
-                    self.logs.append(f"[Risk] Missed earnings estimates in {total - beats} of last {total} quarters.")
+                    self.logs.append(f"[风险] 业绩雷: 过去 {total} 个季度中有 {total - beats} 次不及预期。")
 
         self.long_term_verdict = lt_status
 
         return {
             "price": price,
             "beta": beta,
-            "m_cap": q.get("marketCap") or p.get("mktCap"),
             "market_regime": self.market_regime
         }
 
@@ -237,8 +208,8 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v2.0] Institutional Valuation Model")
-@app_commands.describe(ticker="Ticker Symbol (e.g. NVDA)")
+@bot.tree.command(name="analyze", description="[v2.0] 机构级估值模型 (极简版)")
+@app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
     
@@ -246,45 +217,44 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     success = await model.fetch_data()
     
     if not success:
-        await interaction.followup.send(f"Error: Data not found for `{ticker.upper()}`", ephemeral=True)
+        await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=True)
         return
 
     data = model.analyze()
     if not data:
-        await interaction.followup.send(f"Error: Insufficient data.", ephemeral=True)
+        await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=True)
         return
 
-    # 极简风格颜色：Discord 深色背景下使用白色或浅灰，这里用蓝色作为主色调
+    # 极简风格：深色背景
     embed = discord.Embed(
-        title=f"Deep Dive: {ticker.upper()}",
-        description=f"Price: ${data['price']} | Market Sentiment: {model.market_regime}",
-        color=0x2b2d31 # Discord Dark Embed Color
+        title=f"深度透视: {ticker.upper()}",
+        description=f"现价: ${data['price']} | 市场情绪: {model.market_regime}",
+        color=0x2b2d31 # Discord 深灰/黑色背景色
     )
 
-    # 1. 估值结论 (无 Emoji，无括号)
+    # 1. 估值结论 (无 Emoji，纯文本)
     verdict_text = (
-        f"Short Term: **{model.short_term_verdict}**\n"
-        f"Long Term: **{model.long_term_verdict}**"
+        f"短期: **{model.short_term_verdict}**\n"
+        f"长期: **{model.long_term_verdict}**"
     )
-    embed.add_field(name="Valuation Verdict", value=verdict_text, inline=False)
+    embed.add_field(name="估值结论", value=verdict_text, inline=False)
 
     # 2. Beta
     beta_val = data['beta']
-    beta_desc = "Low Volatility" if beta_val < 0.8 else ("High Volatility" if beta_val > 1.3 else "Moderate")
+    beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     embed.add_field(name="Beta", value=f"{format_num(beta_val)} ({beta_desc})", inline=False)
 
-    # 3. 因子分析 (核心逻辑整合区)
-    # 将 logs 里的内容整合
+    # 3. 因子分析 (核心逻辑整合)
     if model.logs:
         log_str = "\n".join([f"- {log}" for log in model.logs])
-        embed.add_field(name="Factor Analysis", value=f"```\n{log_str}\n```", inline=False)
+        embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
 
-    embed.set_footer(text="Model v2.0 | Historical Percentile & Earnings Surprise Included")
+    embed.set_footer(text="Model v2.0 | 包含历史分位与盈利修正")
 
     await interaction.followup.send(embed=embed)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN not set.")
+        logger.error("DISCORD_TOKEN environment variable not set.")
     else:
         bot.run(DISCORD_TOKEN)
