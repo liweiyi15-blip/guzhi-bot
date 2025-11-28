@@ -15,7 +15,7 @@ FMP_API_KEY = os.getenv('FMP_API_KEY')
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 
-# --- 日志配置 (确保 Railway 能看到) ---
+# --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -26,6 +26,9 @@ logger = logging.getLogger("ValuationBot")
 # --- 1. 数据工具函数 ---
 
 def get_fmp_data(endpoint, ticker, params=""):
+    """
+    通用请求: /endpoint?symbol=TICKER
+    """
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     
@@ -47,12 +50,21 @@ def get_fmp_data(endpoint, ticker, params=""):
         return None
 
 def get_fmp_list_data(endpoint, ticker, limit=4):
-    url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}&limit={limit}"
+    """
+    [修复] 列表请求现在也强制使用 ?symbol=TICKER 格式
+    这解决了 earnings-surprises 在 stable 接口下的 404 问题
+    """
+    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&limit={limit}"
+    safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&limit={limit}"
+    
     try:
+        logger.info(f"📡 Requesting List: {safe_url}")
         response = requests.get(url, timeout=10)
+        
         if response.status_code != 200: 
             logger.error(f"❌ API Error {response.status_code} for list {endpoint}")
             return []
+        
         return response.json()
     except Exception as e:
         logger.error(f"❌ Exception fetching list {endpoint}: {e}")
@@ -84,7 +96,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v3.4) ---
+# --- 3. 估值判断模型 (v3.5) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -115,12 +127,7 @@ class ValuationModel:
         results = await asyncio.gather(*tasks.values())
         self.data = dict(zip(tasks.keys(), results))
         
-        # 基础数据检查
-        has_basic = self.data["profile"] is not None and self.data["quote"] is not None
-        if not has_basic:
-            logger.error(f"❌ CRITICAL: Basic Profile/Quote data missing for {self.ticker}")
-        
-        return has_basic
+        return self.data["profile"] is not None and self.data["quote"] is not None
 
     def analyze(self):
         p = self.data.get("profile", {}) or {}
@@ -138,65 +145,54 @@ class ValuationModel:
         sector = p.get("sector", "Unknown")
         beta = p.get("beta", 1.0)
         
-        # 字段提取
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap", 0)
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
         fcf_yield = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM")
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
         
-        # PEG 与成长
+        # PEG
         peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
         ni_growth = m.get("netIncomeGrowthTTM")
         rev_growth = m.get("revenueGrowthTTM")
 
-        # ---------------------------------------------------------
-        # 🔍 后台数据审计 (Data Audit) - 永久显示在 Railway Logs
-        # ---------------------------------------------------------
+        # 后台审计
         missing_fields = []
         if not m_cap: missing_fields.append("Market Cap")
         if not ev_ebitda: missing_fields.append("EV/EBITDA")
         if not fcf_yield: missing_fields.append("FCF Yield")
         if not roic: missing_fields.append("ROIC")
-        if not peg and not (pe and ni_growth): missing_fields.append("PEG & Growth Data")
         if not earnings: missing_fields.append("Earnings Surprises")
         
         if missing_fields:
-            logger.warning(f"⚠️ [DATA MISSING] {self.ticker}: The following fields are missing: {', '.join(missing_fields)}")
+            logger.warning(f"⚠️ [DATA MISSING] {self.ticker}: {', '.join(missing_fields)}")
         else:
-            logger.info(f"✅ [DATA HEALTHY] {self.ticker}: All core valuation fields retrieved successfully.")
-        # ---------------------------------------------------------
+            logger.info(f"✅ [DATA HEALTHY] {self.ticker}")
 
-        # PEG 手算兜底
         if peg is None and pe and ni_growth and ni_growth > 0:
             try: peg = pe / (ni_growth * 100)
             except: pass
 
-        # 隐含成长率反推
         implied_growth = 0
         if peg and pe and peg > 0:
             implied_growth = (pe / peg) / 100.0
 
-        # 成长分层
         max_growth = max(filter(None, [rev_growth, ni_growth, implied_growth])) if any([rev_growth, ni_growth, implied_growth]) else 0
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
         elif max_growth > 0.2: growth_desc = "高速"
         elif max_growth > 0.05: growth_desc = "稳健"
 
-        # --- 0. 市场情绪 ---
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
         else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
-        # --- 1. 风险量化 ---
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- 2. 短期估值 ---
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
@@ -223,11 +219,9 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 3. 长期估值与策略 ---
         lt_status = "中性"
         is_value_trap = False
 
-        # 陷阱检测
         if net_margin and net_margin < 0 and price_200ma and price < price_200ma:
             is_value_trap = True
             lt_status = "风险极大"
@@ -261,7 +255,6 @@ class ValuationModel:
             if not fcf_yield:
                 self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        # D. Alpha 信号
         if not is_value_trap and earnings and isinstance(earnings, list):
             beats = 0
             total = 0
@@ -302,7 +295,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v3.4] 估值分析 (后台审计版)")
+@bot.tree.command(name="analyze", description="[v3.5] 估值分析 (格式修复版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -347,7 +340,6 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     log_content = []
     if model.flags: log_content.extend(model.flags) 
     log_content.extend([f"- {log}" for log in model.logs])
-    
     log_content.append(f"\n- [策略] {model.strategy}") 
 
     if log_content:
