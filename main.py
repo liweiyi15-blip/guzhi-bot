@@ -37,7 +37,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     try:
         logger.info(f"📡 Requesting: {safe_url}")
-        response = requests.get(url, timeout=10)
+        response = requests.requests.get(url, timeout=10)
         if response.status_code != 200: 
             logger.warning(f"FMP API returned status {response.status_code} for {endpoint}")
             return None
@@ -53,7 +53,7 @@ def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.requests.get(url, timeout=10)
         return response.json() if response.status_code == 200 else []
     except: 
         return []
@@ -482,10 +482,10 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     
     # --- 隐私模式逻辑 ---
     if is_privacy_mode:
-        # *** 修正后的公开状态消息 (两行) ***
+        # *** 修正后的公开状态消息 (新两行格式) ***
         public_message = (
-            f"{interaction.user.mention} 使用 稳-量化估值系统，\n"
-            f"正在分析 `{ticker.upper()}`..."
+            f"{interaction.user.mention} 开启 稳-量化估值系统\n"
+            f"`{ticker.upper()}` 正在分析中⚡..."
         )
         await interaction.channel.send(public_message)
         
