@@ -96,7 +96,7 @@ class ValuationModel:
         self.flags = []  
         self.strategy = "数据不足"  
         self.fcf_yield_display = "N/A" 
-        self.fcf_yield_api = None # 存储原始 FCF Yield
+        self.fcf_yield_api = None 
 
     async def fetch_data(self):
         """异步获取所有 FMP 数据 (现金流量表 limit=4)"""
@@ -138,7 +138,7 @@ class ValuationModel:
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
         
         fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") 
-        self.fcf_yield_api = fcf_yield_api # 存储原始值
+        self.fcf_yield_api = fcf_yield_api 
         
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
@@ -273,7 +273,7 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 长期估值 (加入 PEG 显式分析 & FCF 去重) ---
+        # --- 长期估值 (使用 fcf_yield_used) ---
         lt_status = "中性"
         is_value_trap = False
 
@@ -286,14 +286,12 @@ class ValuationModel:
         
         if not is_value_trap:
             
-            # *** 新增: PEG 显式分析 (修正描述) ***
+            # *** PEG 显式分析 ***
             if peg is not None and peg > 0:
                 if peg < 0.8:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于低位，暗示市场低估了公司的未来成长潜力。")
                 elif peg > 2.5:
-                    # *** 修正后的描述 ***
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 较高，意味着当前的股价已经包含了**极高的未来增长预期**。")
-                    # *** 修正后的描述结束 ***
                 elif 0.8 <= peg <= 2.5:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
             elif peg is not None and peg <= 0 and ni_growth is not None and ni_growth < 0:
@@ -437,7 +435,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup (核心特征显示修正) ---
+# --- 4. Bot Setup (核心特征显示修正 + 脚注修改) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -493,11 +491,6 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     elif meme_pct >= 60: meme_desc = "高流动性"
     elif meme_pct >= 30: meme_desc = "市场关注"
     
-    # 确定显示标签是 Adjusted FCF Yield 还是 FCF Yield
-    # 比较 fcf_yield_display 是否是 Adjusted FCF Yield 的结果
-    api_fcf_formatted = format_percent(model.fcf_yield_api)
-    fcf_label = "Adj FCF Yield" if model.fcf_yield_display != api_fcf_formatted else "FCF Yield (原始)"
-    
     core_factors = (
         f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
         f"> **Meme值:** `{meme_pct}%` ({meme_desc})"
@@ -535,7 +528,9 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     embed.add_field(name="因子分析", value=full_log_str, inline=False)
 
-    embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考，不构成投资建议")
+    # *** 脚注修改 ***
+    embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
+    # *** 脚注修改结束 ***
 
     await interaction.followup.send(embed=embed)
 
