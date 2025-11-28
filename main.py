@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.8 Layout Perfect) ---
+# --- 3. 估值判断模型 (v6.8.1 Wording Fix) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -403,7 +403,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     core_factors = (
         f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
         f"> **PEG:** `{peg_display}` ({data['growth_desc']})\n"
-        f"> **Meme:** `{meme_pct}%` ({meme_desc})"
+        f"> **Meme值:** `{meme_pct}%` ({meme_desc})"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
