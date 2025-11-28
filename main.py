@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 import requests
 import os
@@ -11,12 +12,10 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-# 依然使用 Stable 接口
+# FMP 接口配置
 BASE_URL = "https://financialmodelingprep.com/stable"
+
+# --- 数据获取与处理逻辑 ---
 
 def get_fmp_data(endpoint, ticker):
     url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}"
@@ -42,7 +41,7 @@ class ValuationModel:
         self.data = {}
         self.score = 0
         self.verdict = "未知"
-        self.risk_tag = "未知" # 用标签代替具体的风控建议
+        self.risk_tag = "未知"
 
     async def fetch_all(self):
         loop = asyncio.get_event_loop()
@@ -62,7 +61,7 @@ class ValuationModel:
         ratios = self.data.get("ratios", {})
         metrics = self.data.get("metrics", {})
 
-        if not profile: return
+        if not profile: return None
 
         current_price = profile.get("price")
         beta = profile.get("beta", 1.0)
@@ -72,10 +71,10 @@ class ValuationModel:
         pe = ratios.get("priceEarningsRatioTTM")
         ev_ebitda = metrics.get("enterpriseValueOverEBITDATTM")
 
-        # 1. 风险定性 (Risk Assessment)
+        # 1. 风险定性
         if beta > 1.5:
             self.risk_tag = "⚠️ 高波动 (High Beta)"
-            margin_requirement = 1.25 # 高波动需要更大的折扣才算便宜
+            margin_requirement = 1.25
         elif beta < 0.8:
             self.risk_tag = "🛡️ 防御型 (Low Beta)"
             margin_requirement = 1.0
@@ -85,15 +84,13 @@ class ValuationModel:
 
         analysis_log = []
 
-        # 2. 估值打分 (逻辑保持科学严谨)
-        
-        # DCF (绝对估值)
+        # 2. 估值打分 (逻辑保持严谨)
+        # DCF
         if dcf_value:
             upside = (dcf_value - current_price) / current_price
-            # 根据 Beta 调整判定标准
             if upside > 0.2 * margin_requirement:
                 self.score += 4
-                analysis_log.append(f"✅ 价格低于内在价值 (低估幅度 {upside*100:.1f}%)")
+                analysis_log.append(f"✅ 价格低于内在价值 (空间 +{upside*100:.1f}%)")
             elif upside > 0:
                 self.score += 2
                 analysis_log.append(f"☑️ 价格接近内在价值 (公允)")
@@ -103,7 +100,7 @@ class ValuationModel:
             else:
                 analysis_log.append(f"⚠️ 价格略有溢价")
 
-        # PEG (成长性修正)
+        # PEG
         if peg:
             if 0 < peg < 1.0:
                 self.score += 3
@@ -115,7 +112,7 @@ class ValuationModel:
                 self.score -= 2
                 analysis_log.append(f"❌ PEG {peg:.2f} (透支未来业绩)")
 
-        # EV/EBITDA (机构倍数)
+        # EV/EBITDA
         if ev_ebitda:
             if ev_ebitda < 15:
                 self.score += 3
@@ -127,7 +124,7 @@ class ValuationModel:
                 self.score += 1
                 analysis_log.append(f"☑️ EV/EBITDA 估值中性")
 
-        # 3. 最终评判 (只说贵贱，不说买卖)
+        # 3. 评判结论
         if self.score >= 7:
             self.verdict = "🟢 极度低估 (Deep Value)"
         elif self.score >= 4:
@@ -151,24 +148,52 @@ class ValuationModel:
             "image": profile.get("image")
         }
 
+# --- Bot 设置与 Slash Command ---
+
+class ValuationBot(commands.Bot):
+    def __init__(self):
+        # 设置 intents
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # 启动时同步 Slash 命令
+        # 注意：全局同步可能需要几分钟到1小时生效。
+        # 如果是私有服务器，可以使用 guild=discord.Object(id=YOUR_GUILD_ID) 进行秒级同步
+        print("正在同步 Slash 命令...")
+        await self.tree.sync()
+        print("Slash 命令同步完成！")
+
+bot = ValuationBot()
+
 @bot.event
 async def on_ready():
-    print(f'Valuation Bot Logged in as {bot.user}')
+    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    print('------')
 
-@bot.command(name='value')
-async def valuation(ctx, ticker: str):
-    msg = await ctx.send(f"🔄 正在测算 {ticker.upper()} 的估值水平...")
+# 定义 Slash Command
+@bot.tree.command(name="value", description="基于机构模型测算美股估值 (DCF/PEG/EBITDA)")
+@app_commands.describe(ticker="股票代码 (例如: NVDA, AAPL)")
+async def value(interaction: discord.Interaction, ticker: str):
+    # 1. 立即回复 "Thinking..." 避免超时
+    await interaction.response.defer(thinking=True)
     
+    # 2. 调取数据
     model = ValuationModel(ticker)
     success = await model.fetch_all()
     
     if not success:
-        await msg.edit(content=f"❌ 无法获取 {ticker.upper()} 数据，请检查拼写。")
+        # 使用 followup 发送结果
+        await interaction.followup.send(f"❌ 找不到代码 `{ticker.upper()}` 或 API 数据不可用。", ephemeral=True)
         return
 
     result = model.calculate_valuation()
-    
-    # 颜色：绿色代表便宜，红色代表贵
+    if not result:
+        await interaction.followup.send(f"⚠️ 数据解析失败，请稍后重试。", ephemeral=True)
+        return
+
+    # 3. 构建 Embed
     embed = discord.Embed(
         title=f"📊 估值评测: {result['company_name']} ({ticker.upper()})",
         description=f"**当前评价:** {model.verdict}\n基于 DCF、PEG 及 EV/EBITDA 多因子模型测算。",
@@ -178,27 +203,29 @@ async def valuation(ctx, ticker: str):
     if result['image']:
         embed.set_thumbnail(url=result['image'])
 
-    # 第一行：价格与内在价值对比
+    # 字段展示
     embed.add_field(name="当前价格", value=f"${result['price']}", inline=True)
     embed.add_field(name="内在价值 (DCF)", value=format_num(result['dcf'], True), inline=True)
     embed.add_field(name="风险属性 (Beta)", value=f"{format_num(result['beta'])} \n{model.risk_tag}", inline=True)
 
-    # 第二行：机构核心指标
     metrics_str = (
         f"**P/E (TTM):** {format_num(result['pe'])}\n"
         f"**PEG Ratio:** {format_num(result['peg'])}\n"
         f"**EV/EBITDA:** {format_num(result['ev_ebitda'])}"
     )
-    embed.add_field(name="估值倍数 (Valuation Multiples)", value=metrics_str, inline=False)
+    embed.add_field(name="估值倍数 (TTM)", value=metrics_str, inline=False)
 
-    # 第三行：评判逻辑细节
     log_str = "\n".join(result['logs'])
     embed.add_field(name="🔬 评测详情", value=f"```{log_str}```", inline=False)
 
-    embed.set_footer(text="Data: Financial Modeling Prep | 结果仅供参考，不构成投资建议")
+    embed.set_footer(text="Data: Financial Modeling Prep | 仅供参考")
 
-    await msg.delete()
-    await ctx.send(embed=embed)
+    # 4. 发送最终结果
+    await interaction.followup.send(embed=embed)
 
+# 运行 Bot
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    if not DISCORD_TOKEN:
+        print("Error: DISCORD_TOKEN environment variable not set.")
+    else:
+        bot.run(DISCORD_TOKEN)
