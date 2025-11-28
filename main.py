@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.7 iOS Quotes) ---
+# --- 3. 估值判断模型 (v6.8 Layout Perfect) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -382,7 +382,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         color=0x2b2d31
     )
 
-    # [排版] 估值结论：使用 Quote Block
+    # [排版] 估值结论：引用块 >
     verdict_text = (
         f"> **短期:** {model.short_term_verdict}\n"
         f"> **长期:** {model.long_term_verdict}"
@@ -407,7 +407,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
-    # [排版] Risk 字段：恢复单独显示，内容加 Quote
+    # [排版] Risk 字段
     if data['risk_var'] != "N/A":
         embed.add_field(
             name="95% VaR (月度风险)", 
@@ -415,12 +415,10 @@ async def analyze(interaction: discord.Interaction, ticker: str):
             inline=False
         )
 
-    # [排版] 因子分析：每一条都使用 Quote Block
+    # [排版] 因子分析：使用 \n> \n 来连接，制造连贯的竖线
     log_content = []
     if model.flags: log_content.extend(model.flags) 
     log_content.extend([f"{log}" for log in model.logs])
-    
-    strategy_text = f"**[策略]** {model.strategy}"
     
     formatted_logs = []
     for log in log_content:
@@ -429,20 +427,23 @@ async def analyze(interaction: discord.Interaction, ticker: str):
             tag_end = log.find("]") + 1
             tag = log[:tag_end]
             content = log[tag_end:]
-            # 整个条目加 Quote > 
+            # 注意：这里我们给每一行都加 >，稍后在join时中间加带>的空行
             formatted_logs.append(f"> **{tag}**{content}")
         else:
             formatted_logs.append(f"> {log}")
 
-    # 使用双换行 \n\n 连接，确保 iOS 上显示为独立块
-    log_str = "\n\n".join(formatted_logs)
+    # [核心技巧] 使用 \n> \n 连接，这样空行也会被引用，竖线就不断了
+    factor_str = "\n> \n".join(formatted_logs)
     
-    # 策略单独加一个空行后再引用
-    log_str += f"\n\n> {strategy_text}"
+    # 策略单独放在引用块外面，不加 > 
+    strategy_text = f"**[策略]** {model.strategy}"
     
-    if len(log_str) > 1000: log_str = log_str[:990] + "..."
+    # 组合：因子引用块 + 双换行 + 策略
+    full_log_str = f"{factor_str}\n\n{strategy_text}"
+    
+    if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
 
-    embed.add_field(name="因子分析", value=log_str, inline=False)
+    embed.add_field(name="因子分析", value=full_log_str, inline=False)
 
     embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考")
 
