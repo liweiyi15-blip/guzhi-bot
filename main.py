@@ -70,7 +70,7 @@ def get_sector_benchmark(sector):
         if key in str(sector): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v5.3) ---
+# --- 3. 估值判断模型 (v5.4) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -78,6 +78,7 @@ class ValuationModel:
         self.data = {}
         self.short_term_verdict = "未知"
         self.long_term_verdict = "未知"
+        self.market_regime = "未知" # [修复] 补回初始化
         self.risk_var = "N/A" 
         self.logs = [] 
         self.flags = [] 
@@ -146,40 +147,38 @@ class ValuationModel:
 
         vix = vix_data.get("price", 20)
         
+        # [核心修复] 补回 VIX 判定逻辑
+        if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
+        elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
+        else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
+
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
         # ==============================================================================
-        # 🔥 v5.3 Meme值 (热度) 计算 - 满分100%
+        # 🔥 v5.3 Meme值 (热度) 计算
         # ==============================================================================
-        meme_score = 0
+        faith_score = 0
         
-        # 1. 波动性 (Beta) - 权重 30%
-        if beta:
-            if beta > 2.0: meme_score += 30
-            elif beta > 1.3: meme_score += 15
+        # 1. 散户因子
+        if beta and beta > 2.0: faith_score += 2
         
-        # 2. 动量 (Price vs 200MA) - 权重 30%
-        if price and price_200ma:
-            ratio_ma = price / price_200ma
-            if ratio_ma > 1.3: meme_score += 30
-            elif ratio_ma > 1.1: meme_score += 15
-            
-        # 3. 估值热度 (P/S or EV/EBITDA) - 权重 40%
-        # 只要有一项指标显示“贵”，就说明有人在追高
-        valuation_hot = False
-        if (ps_ratio and ps_ratio > 15) or (ev_ebitda and ev_ebitda > 50):
-            valuation_hot = True
-            meme_score += 40
-        elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30):
-            meme_score += 20
+        # 2. 动量因子
+        if price and price_200ma and price > price_200ma * 1.5: faith_score += 3
+        
+        # 3. 泡沫因子
+        if (ps_ratio and ps_ratio > 25) or (ev_ebitda and ev_ebitda > 80): faith_score += 2
 
-        # 上限 100%
-        meme_pct = min(100, meme_score)
+        # 4. 垃圾因子
+        if roic:
+            if roic < 0.05: faith_score += 3
+            elif roic > 0.20: faith_score -= 5 # 顶级业绩豁免
+
+        faith_score = max(0, min(10, faith_score))
+        meme_pct = int(faith_score * 10) 
         
-        # 信仰模式触发：Meme值 > 70%
-        is_faith_mode = meme_pct >= 70
+        is_faith_mode = faith_score >= 5
         # ==============================================================================
 
         sector_avg = get_sector_benchmark(sector)
@@ -254,27 +253,25 @@ class ValuationModel:
             if not fcf_yield:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        # D. Alpha 信号 (永远显示)
-        valid_earnings = []
-        if isinstance(earnings, list):
+        if not is_value_trap and earnings and isinstance(earnings, list):
+            valid_earnings = []
             for e in earnings:
                 est = e.get("epsEstimated") or e.get("estimatedEarning")
                 act = e.get("epsActual") or e.get("eps") or e.get("actualEarningResult")
                 if est is not None and act is not None:
                     valid_earnings.append({"est": est, "act": act})
-        
-        recent = valid_earnings[:4]
-        if len(recent) > 0:
-            beats = sum(1 for x in recent if x["act"] > x["est"])
-            total = len(recent)
-            beat_rate = beats / total
-            if beat_rate >= 0.75:
-                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
+            
+            recent = valid_earnings[:4]
+            if len(recent) > 0:
+                beats = sum(1 for x in recent if x["act"] > x["est"])
+                total = len(recent)
+                beat_rate = beats / total
+                if beat_rate >= 0.75:
+                    self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
+                else:
+                    self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
             else:
-                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
-        else:
-            # 兜底日志
-            self.logs.append(f"[Alpha] 暂无有效财报数据，无法判断业绩趋势。")
+                self.logs.append(f"[Alpha] 暂无有效财报数据，无法判断业绩趋势。")
 
         self.long_term_verdict = lt_status
 
@@ -304,7 +301,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v5.3] 估值分析 (热度重构版)")
+@bot.tree.command(name="analyze", description="[v5.4] 估值分析 (崩溃修复版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -323,8 +320,8 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     embed = discord.Embed(
         title=f"估值分析: {ticker.upper()}",
-        # 移除市场情绪，仅保留价格和市值
-        description=f"现价: ${data['price']:.2f} | 市值: {format_market_cap(data['m_cap'])}",
+        # [修复] 移除 market_regime 显示，因为已经不放在标题栏了
+        description=f"现价: ${data['price']} | 市值: {format_market_cap(data['m_cap'])}",
         color=0x2b2d31
     )
 
@@ -338,7 +335,6 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     peg_display = format_num(data['peg']) if data['peg'] else "N/A"
     
-    # 增加 Meme值
     core_factors = (
         f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
         f"**PEG:** {peg_display} ({data['growth_desc']})\n"
