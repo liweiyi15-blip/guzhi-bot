@@ -482,10 +482,14 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     
     # --- 隐私模式逻辑 ---
     if is_privacy_mode:
-        # 1. 发送公开状态消息
-        await interaction.channel.send(f"正在查询 `{ticker.upper()}` 代码...")
+        # *** 修正后的公开状态消息 (两行) ***
+        public_message = (
+            f"{interaction.user.mention} 使用 稳-量化估值系统，\n"
+            f"正在分析 `{ticker.upper()}`..."
+        )
+        await interaction.channel.send(public_message)
         
-        # 2. 延迟响应，并设置为仅自己可见 (ephemeral=True)
+        # 延迟响应，并设置为仅自己可见 (ephemeral=True)
         await interaction.response.defer(thinking=True, ephemeral=True)
         ephemeral_result = True
     else:
@@ -498,7 +502,6 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     success = await model.fetch_data()
     
     if not success:
-        # 使用 followup 发送错误消息，遵循 ephemeral 状态
         await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
         return
 
