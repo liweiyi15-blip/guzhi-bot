@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 数据工具函数 ---
+# --- 1. 数据工具函数 (保持不变) ---
 
 def get_fmp_data(endpoint, ticker, params=""):
     """从 FMP API 获取数据"""
@@ -38,9 +38,10 @@ def get_fmp_data(endpoint, ticker, params=""):
             logger.warning(f"FMP API returned status {response.status_code} for {endpoint}")
             return None
         data = response.json()
-        # 针对部分端点返回列表的情况，取第一个元素
-        if isinstance(data, list) and "historical" not in endpoint:
+        # 恢复对大部分 TTM 端点的取第一个元素逻辑，现金流量表返回列表
+        if isinstance(data, list) and endpoint not in ["earnings", "cash-flow-statement"] and "historical" not in endpoint:
             return data[0] if len(data) > 0 else None
+        # cash-flow-statement 和 earnings 返回完整列表
         return data
     except Exception as e:
         logger.error(f"Error fetching {endpoint}: {e}")
@@ -70,7 +71,7 @@ def format_market_cap(num):
     if num >= 1e9: return f"${num/1e9:.2f}B"
     return f"${num/1e6:.2f}M"
 
-# --- 2. 行业基准 ---
+# --- 2. 行业基准 (保持不变) ---
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0, "Consumer Electronics": 25.0, "Communication Services": 20.0,
     "Healthcare": 18.0, "Financial Services": 12.0, "Energy": 10.0,
@@ -78,7 +79,6 @@ SECTOR_EBITDA_MEDIAN = {
 }
 
 def get_sector_benchmark(sector):
-    """根据行业获取平均 EV/EBITDA 倍数"""
     if not sector: return 18.0
     for key in SECTOR_EBITDA_MEDIAN:
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
@@ -97,11 +97,10 @@ class ValuationModel:
         self.logs = []  
         self.flags = []  
         self.strategy = "数据不足"  
-        # 新增用于显示的调整后 FCF Yield
-        self.adj_fcf_yield_display = "N/A"
+        self.fcf_yield_display = "N/A" # FCF Yield 显示 (可能为原始，可能为 adjusted)
 
     async def fetch_data(self):
-        """异步获取所有 FMP 数据 (新增 Cash Flow Statement)"""
+        """异步获取所有 FMP 数据 (现金流量表改为 limit=4)"""
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
         loop = asyncio.get_event_loop()
         tasks = {
@@ -110,8 +109,8 @@ class ValuationModel:
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
-            # **新增 Cash Flow Statement**
-            "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "limit=1"), 
+            # *** 关键修改: 现金流量表改为 limit=4 ***
+            "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
             "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
         }
@@ -120,39 +119,37 @@ class ValuationModel:
         return self.data["profile"] is not None and self.data["quote"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑"""
+        """核心估值分析逻辑 (TTM Adjusted FCF)"""
         p = self.data.get("profile", {}) or {}
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
         earnings = self.data.get("earnings", []) or {}
-        cf = self.data.get("cf", {}) or {} # 新增 Cash Flow Statement 数据
+        cf_list = self.data.get("cf", []) or [] 
         
         if not p or not q: return None
 
         price = q.get("price")
         price_200ma = q.get("priceAvg200")
-        vol_today = q.get("volume")
-        vol_avg = q.get("avgVolume")
         sector = p.get("sector", "Unknown")
         beta = p.get("beta")
         if beta is None: beta = 1.0 
         
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap", 0)
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
-        fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") # 原始 API FCF Yield
+        fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") 
         
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
         ps_ratio = r.get("priceToSalesRatioTTM")
         
-        # PEG 计算 (略 - 保持不变)
+        # PEG/Growth 计算
         peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
         ni_growth = m.get("netIncomeGrowthTTM")
-        rev_growth = m.get("revenueGrowthTTM")
-
+        rev_growth = r.get("revenueGrowthTTM") 
+        
         if peg is None and pe and ni_growth and ni_growth > 0:
             try: peg = pe / (ni_growth * 100)
             except: pass
@@ -170,23 +167,39 @@ class ValuationModel:
         elif max_growth > 0.05: growth_desc = "稳健"
         if peg and peg > 3.0: growth_desc = "高预期"
         
-        # --- Adjusted FCF Yield (方案二核心) ---
+        
+        # --- Adjusted FCF Yield (TTM 手动计算 - 方案二) ---
         adj_fcf_yield = None
-        cfo = cf.get("cashFlowFromOperations")
-        dep_amort = cf.get("depreciationAndAmortization")
         
-        if cfo is not None and dep_amort is not None and m_cap and m_cap > 0:
-            # 估算维护性 CapEx 为 D&A 的 50%
-            MAINTENANCE_CAPEX_RATIO = 0.5 
-            maintenance_capex = dep_amort * MAINTENANCE_CAPEX_RATIO
-            adj_fcf = cfo - maintenance_capex
-            adj_fcf_yield = adj_fcf / m_cap
-            self.adj_fcf_yield_display = format_percent(adj_fcf_yield)
-        
-        # 使用 Adjusted FCF Yield 进行判断，如果 Adjusted FCF Yield 不可用，则回退到原始 API 数据
-        fcf_yield_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
+        if len(cf_list) >= 4 and m_cap and m_cap > 0:
+            ttm_cfo = 0
+            ttm_dep_amort = 0
+            
+            for q_data in cf_list[:4]: 
+                cfo_q = q_data.get("netCashProvidedByOperatingActivities")
+                dep_amort_q = q_data.get("depreciationAndAmortization")
+                
+                if cfo_q is not None and dep_amort_q is not None:
+                    ttm_cfo += cfo_q
+                    ttm_dep_amort += dep_amort_q
+                else:
+                    logger.warning(f"Missing CFO or D&A in quarterly data for TTM calculation. Aborting Adj FCF calculation.")
+                    ttm_cfo = 0 
+                    break 
 
-        # VIX/风险/Meme模型 (保持不变)
+            if ttm_cfo != 0:
+                MAINTENANCE_CAPEX_RATIO = 0.5 
+                maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
+                adj_fcf = ttm_cfo - maintenance_capex
+                adj_fcf_yield = adj_fcf / m_cap
+                self.fcf_yield_display = format_percent(adj_fcf_yield) 
+            
+        # 如果 Adjusted FCF Yield 不可用，回退到原始 API FCF Yield
+        fcf_yield_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
+        if fcf_yield_used == fcf_yield_api:
+            self.fcf_yield_display = format_percent(fcf_yield_api) 
+        
+        # ... (VIX/风险/Meme Score/短期估值逻辑 保持不变) ...
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
@@ -195,30 +208,27 @@ class ValuationModel:
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
-
-        # ... (Meme/信仰值模型 保持不变) ...
-        meme_score = 0
         
-        # 计分逻辑...
+        meme_score = 0
+        vol_today = q.get("volume")
+        vol_avg = q.get("avgVolume")
+        
+        # Meme 计分逻辑... (略)
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
             
-        if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): 
-            meme_score += 4
-        elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): 
-            meme_score += 2
-        elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): 
-            meme_score += 1
+        if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): meme_score += 4
+        elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): meme_score += 2
+        elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): meme_score += 1
             
         if beta > 2.0: meme_score += 2
         elif beta > 1.3: meme_score += 1
             
         if price and price_200ma and price > price_200ma:
-            bad_fcf = (fcf_yield_api is not None and fcf_yield_api < 0.01) # 注意：这里沿用 API FCF 判断极端扭曲
+            bad_fcf = (fcf_yield_api is not None and fcf_yield_api < 0.01)
             bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
-            if bad_fcf or bad_peg:
-                meme_score += 2
+            if bad_fcf or bad_peg: meme_score += 2
             
         if vol_today and vol_avg and vol_avg > 0:
             if vol_today > vol_avg * 1.2: meme_score += 1
@@ -234,7 +244,6 @@ class ValuationModel:
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
-        # --- 短期估值逻辑 (保持不变) ---
         is_distressed = False
         if (net_margin is not None and net_margin < -0.05) or (fcf_yield_api is not None and fcf_yield_api < -0.02):
             is_distressed = True
@@ -265,7 +274,7 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 长期估值 (使用 Adjusted FCF Yield) ---
+        # --- 长期估值 (使用 fcf_yield_used) ---
         lt_status = "中性"
         is_value_trap = False
 
@@ -277,7 +286,7 @@ class ValuationModel:
             self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
-            # --- 信仰模式 (Meme Score 50%+) 的细化分析 (保持不变) ---
+            # ... (Meme 信仰模式逻辑 保持不变) ...
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
@@ -302,42 +311,43 @@ class ValuationModel:
                 if self.strategy == "数据不足":
                     self.strategy = meme_strategy
 
-            # --- 长期估值判断逻辑 (使用 fcf_yield_used) ---
+            # --- 长期估值判断逻辑 (使用 FCF Yield，并加入 CapEx 修正提示) ---
             if fcf_yield_used is not None:
-                # 优先使用调整后的 FCF Yield
-                fcf_str = self.adj_fcf_yield_display if adj_fcf_yield is not None else format_percent(fcf_yield_used)
+                fcf_str = self.fcf_yield_display
                 
-                # 只有当 Adjusted FCF Yield 可用时，才进行 CapEx 投资修正的日志记录
+                # *** 记录修正状态 ***
                 if adj_fcf_yield is not None:
-                    # 报告 Adjustment 的效果
                     if adj_fcf_yield > fcf_yield_api:
                         self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
-                    
-                    if adj_fcf_yield < 0.02 and "高速" in growth_desc:
-                         self.logs.append(f"[增长性 CapEx] Adjusted FCF Yield ({fcf_str}) 仍较低，表明公司持续将现金流大量投入高增长项目。")
+                    elif adj_fcf_yield < fcf_yield_api:
+                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(fcf_yield_api)})。")
+                elif fcf_yield_api is not None:
+                     self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
+                # *** 修正状态记录结束 ***
 
-                
+                is_high_quality_growth = (
+                    ("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15
+                )
+
                 if fcf_yield_used > 0.04 and not is_faith_mode:
                     lt_status = "便宜"
                     self.logs.append(f"[价值] FCF Yield ({fcf_str}) 丰厚，提供良好安全垫。")
                     if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                 
-                elif fcf_yield_used < 0.02 and not is_faith_mode:
-                    lt_status = "昂贵"
-                    if "高速" in growth_desc:
-                         self.logs.append(f"[价值] FCF Yield ({fcf_str}) 较低，当前估值高度依赖未来高增长兑现。")
-                         if self.strategy == "数据不足": self.strategy = "估值包含较高增长预期，股价波动可能随业绩剧烈放大，需要警惕。"
-                    else:
-                        self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显增长支撑，隐含预期过高，风险较大。")
-                        if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
+                elif fcf_yield_used < 0.02 and is_high_quality_growth and not is_faith_mode:
+                    lt_status = "预期驱动/投资扩张"
+                    self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
+                    if self.strategy == "数据不足": self.strategy = "估值已反映高增长预期，价格波动可能随业绩剧烈放大，需要警惕。"
                 
-                elif fcf_yield_used < 0.025 and roic and roic > 0.20:
-                    # 对于高 ROIC 公司，即使调整后 FCF Yield 仍然中等偏低，也属于“优质溢价”
-                    if not is_faith_mode:
-                        lt_status = "优质/值得等待"
-                        if self.strategy == "数据不足": self.strategy = "此类高效率资产的低 FCF Yield 是资本扩张所致，适合长期配置者择机分批建仓。"
-                    self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 虽低，但 ROIC ({format_percent(roic)}) 极高，属于'优质溢价'或高效率增长投资。")
-
+                elif fcf_yield_used < 0.02 and not is_high_quality_growth and not is_faith_mode:
+                    lt_status = "昂贵"
+                    self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
+                    if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
+                
+                elif roic and roic > 0.20 and not is_faith_mode:
+                    lt_status = "优质/值得等待"
+                    if self.strategy == "数据不足": self.strategy = "此类高效率资产适合长期配置者择机分批建仓。"
+                    self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
 
             if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
                 self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
@@ -345,6 +355,7 @@ class ValuationModel:
             
             if fcf_yield_used is None:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
+                self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
             # D. Alpha 信号 (保持不变)
             valid_earnings = []
@@ -374,7 +385,7 @@ class ValuationModel:
             else:
                 self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
 
-            # --- 策略修正层 (保持不变) ---
+            
             if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
                 self.strategy = "估值看似极低，但营收处于萎缩周期，需要警惕‘低估值陷阱’。"
                 lt_status = "周期性风险"
@@ -406,7 +417,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup ---
+# --- 4. Bot Setup (核心特征显示修正) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -463,13 +474,14 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     elif meme_pct >= 60: meme_desc = "高流动性"
     elif meme_pct >= 30: meme_desc = "市场关注"
     
-    # 将调整后的 FCF Yield 纳入核心特征显示（如果没有则显示 N/A）
-    adj_fcf_display = model.adj_fcf_yield_display
+    # 确定显示标签是 Adjusted FCF Yield 还是 FCF Yield
+    # 检查 fcf_yield_display 是否是 Adjusted FCF Yield 的结果
+    fcf_label = "Adj FCF Yield" if model.fcf_yield_display != format_percent(model.data.get("metrics", {}).get('freeCashFlowYield')) else "FCF Yield (原始)"
     
     core_factors = (
         f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
         f"> **PEG:** `{peg_display}` ({data['growth_desc']})\n"
-        f"> **Adj FCF Yield:** `{adj_fcf_display}` (已修正 CapEx)\n"
+        f"> **{fcf_label}:** `{model.fcf_yield_display}`\n"
         f"> **Meme值:** `{meme_pct}%` ({meme_desc})"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
