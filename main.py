@@ -89,7 +89,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v2.6) ---
+# --- 3. 估值判断模型 (v2.7) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -125,6 +125,7 @@ class ValuationModel:
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
+        bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
         earnings = self.data.get("earnings", []) or []
         
@@ -161,11 +162,11 @@ class ValuationModel:
         if (rev_growth and rev_growth > 0.2) or (ni_growth_val and ni_growth_val > 0.2):
             is_hyper_growth = True
 
-        # --- 0. 市场情绪 ---
+        # --- 0. 市场情绪 (两字形容) ---
         vix = vix_data.get("price", 20)
-        if vix < 20: self.market_regime = f"风平浪静 (VIX {vix:.1f})"
-        elif vix < 30: self.market_regime = f"市场震荡 (VIX {vix:.1f})"
-        else: self.market_regime = f"恐慌模式 (VIX {vix:.1f})"
+        if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
+        elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
+        else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
         # --- 1. 短期估值 ---
         sector_avg = get_sector_benchmark(sector)
@@ -188,7 +189,8 @@ class ValuationModel:
                     self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 远高于行业均值 {sector_avg}，且缺乏增长支撑。")
             else:
                 st_status = "估值合理"
-                self.logs.append(f"[板块] EV/EBITDA 与行业均值接近，估值处于合理区间。")
+                # 修改点：这里显示具体的数值
+                self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
         else:
              self.logs.append(f"[板块] 缺少 EV/EBITDA 数据。")
         
@@ -233,10 +235,7 @@ class ValuationModel:
             "beta": beta,
             "market_regime": self.market_regime,
             "peg": peg,
-            "m_cap": m_cap,
-            "ev_ebitda": ev_ebitda, 
-            "fcf_yield": fcf_yield,
-            "roic": roic
+            "m_cap": m_cap
         }
 
 # --- 4. Bot Setup ---
@@ -254,7 +253,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v2.6] 机构级估值模型 (优化布局)")
+@bot.tree.command(name="analyze", description="[v2.7] 估值分析 (UI精修版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -273,7 +272,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     # 极简深色背景
     embed = discord.Embed(
-        title=f"深度透视: {ticker.upper()}",
+        title=f"估值分析: {ticker.upper()}", # 标题修改
         description=f"现价: ${data['price']} | 市值: {format_market_cap(data['m_cap'])} | 市场情绪: {model.market_regime}",
         color=0x2b2d31
     )
@@ -286,19 +285,12 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
-    
     peg_display = format_num(data['peg']) if data['peg'] else "N/A"
-    ev_display = format_num(data['ev_ebitda']) if data['ev_ebitda'] else "N/A"
-    fcf_display = format_percent(data['fcf_yield']) if data['fcf_yield'] else "N/A"
-    roic_display = format_percent(data['roic']) if data['roic'] else "N/A"
-
-    # --- 布局调整: EV/EBITDA 提到第一行 ---
+    
+    # 修改点：核心特征只保留 Beta 和 PEG
     core_factors = (
-        f"**EV/EBITDA:** {ev_display}\n"
         f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
-        f"**PEG:** {peg_display} (成长性价比)\n"
-        f"**FCF Yield:** {fcf_display}\n"
-        f"**ROIC:** {roic_display}"
+        f"**PEG:** {peg_display} (成长性价比)"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
 
@@ -306,7 +298,8 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         log_str = "\n".join([f"- {log}" for log in model.logs])
         embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
 
-    embed.set_footer(text="模型建议，仅作参考 | Model v2.6")
+    # 脚注修改
+    embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考")
 
     await interaction.followup.send(embed=embed)
 
