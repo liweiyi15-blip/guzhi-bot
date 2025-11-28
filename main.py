@@ -39,7 +39,6 @@ def get_fmp_data(endpoint, ticker, params=""):
         
         data = response.json()
         
-        # FMP 通用处理
         if isinstance(data, list) and "historical" not in endpoint:
             if len(data) > 0:
                 return data[0]
@@ -51,15 +50,10 @@ def get_fmp_data(endpoint, ticker, params=""):
         return None
 
 def get_fmp_list_data(endpoint, ticker, limit=4):
-    """
-    处理路径参数型接口 (如 earnings-surprises)
-    """
     url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}&limit={limit}"
-    
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-             return []
+        if response.status_code != 200: return []
         return response.json()
     except:
         return []
@@ -95,7 +89,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v2.4) ---
+# --- 3. 估值判断模型 (v2.6) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -131,7 +125,6 @@ class ValuationModel:
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
-        bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
         earnings = self.data.get("earnings", []) or []
         
@@ -141,36 +134,25 @@ class ValuationModel:
         sector = p.get("sector", "Unknown")
         beta = p.get("beta", 1.0)
         
-        # --- 字段提取 ---
-        # 1. 市值 (三重保险)
+        # 字段提取
         m_cap = q.get("marketCap")
         if not m_cap or m_cap == 0: m_cap = m.get("marketCap")
         if not m_cap or m_cap == 0: m_cap = p.get("mktCap", 0)
 
-        # 2. EV/EBITDA (多字段兼容)
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
-        
-        # 3. FCF Yield
         fcf_yield = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM")
-        
-        # 4. ROIC
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
-
-        # --- 核心更新: PEG 智能读取 ---
-        # FMP 在 ratios-ttm 中使用全称 'priceToEarningsGrowthRatioTTM'
-        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         
-        # 兜底逻辑：如果 API 没给 PEG，但给了 PE 和增长率，我们手算
+        # PEG
+        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         if peg is None:
             pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
             ni_growth = m.get("netIncomeGrowthTTM")
-            
             if pe and ni_growth and ni_growth > 0:
                 try:
                     peg = pe / (ni_growth * 100)
-                    self.logs.append(f"[数据] API PEG 缺失，已基于利润增速 {format_percent(ni_growth)} 手算。")
-                except:
-                    pass
+                    self.logs.append(f"[数据] 手算 PEG: {format_num(peg)} (PE {format_num(pe)} / Growth {format_percent(ni_growth)})")
+                except: pass
 
         # 高成长判定
         is_hyper_growth = False
@@ -187,27 +169,26 @@ class ValuationModel:
 
         # --- 1. 短期估值 ---
         sector_avg = get_sector_benchmark(sector)
-        st_status = "中性"
+        st_status = "估值合理"
         
         if ev_ebitda:
             ratio = ev_ebitda / sector_avg
-            # PEG 豁免逻辑
             if is_hyper_growth and peg and peg < 1.2:
-                st_status = "成长性极低估"
-                self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 高，但 PEG ({format_num(peg)}) 极低。")
+                st_status = "便宜 (高成长)"
+                self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
             elif ratio < 0.7:
-                st_status = "显著低估"
-                self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 低于行业均值 {sector_avg} 超过 30%。")
+                st_status = "便宜"
+                self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 低于行业均值 {sector_avg}，折扣明显。")
             elif ratio > 1.3:
                 if is_hyper_growth and peg and peg < 1.8:
                      st_status = "合理溢价"
-                     self.logs.append(f"[成长特权] 高估值被高增长消化 (PEG {format_num(peg)})。")
+                     self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
                 else:
-                    st_status = "显著高估"
-                    self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 显著高于行业，且无 PEG 支撑。")
+                    st_status = "昂贵"
+                    self.logs.append(f"[板块] EV/EBITDA {format_num(ev_ebitda)} 远高于行业均值 {sector_avg}，且缺乏增长支撑。")
             else:
-                st_status = "行业同步"
-                self.logs.append(f"[板块] 估值与行业同步。")
+                st_status = "估值合理"
+                self.logs.append(f"[板块] EV/EBITDA 与行业均值接近，估值处于合理区间。")
         else:
              self.logs.append(f"[板块] 缺少 EV/EBITDA 数据。")
         
@@ -218,16 +199,16 @@ class ValuationModel:
         if fcf_yield:
             if is_hyper_growth and fcf_yield > 0.015:
                 lt_status = "成长可持续"
-                self.logs.append(f"[价值] 高成长股 FCF Yield {format_percent(fcf_yield)} 已达安全区间。")
+                self.logs.append(f"[价值] 对于高成长股，FCF Yield {format_percent(fcf_yield)} 已处于安全区间。")
             elif fcf_yield > 0.04:
                 lt_status = "便宜"
-                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 回报丰厚。")
+                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 较高，长期持有回报率可观。")
             elif fcf_yield < 0.02 and not is_hyper_growth:
                 lt_status = "昂贵"
-                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 极低。")
+                self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 极低，意味着当前价格昂贵，正在透支未来。")
             
             if roic and roic > 0.15:
-                self.logs.append(f"[护城河] ROIC {format_percent(roic)} 显示极高资本效率。")
+                self.logs.append(f"[护城河] ROIC {format_percent(roic)} 极高，公司赚钱效率一流。")
                 if lt_status == "中性": lt_status = "优质"
 
         # C. 盈利惊喜
@@ -241,11 +222,9 @@ class ValuationModel:
                     total += 1
                     if act > est: beats += 1
             
-            if total > 0:
-                beat_rate = beats / total
-                if beat_rate == 1.0:
-                    self.logs.append(f"[Alpha] 业绩惊喜: 过去 {total} 个季度连续 Beat 预期。")
-                    if lt_status == "中性": lt_status = "动能强劲"
+            if total > 0 and (beats / total) == 1.0:
+                 self.logs.append(f"[Alpha] 业绩连续 {total} 个季度超预期，机构情绪乐观。")
+                 if lt_status == "中性": lt_status = "动能强劲"
 
         self.long_term_verdict = lt_status
 
@@ -254,7 +233,10 @@ class ValuationModel:
             "beta": beta,
             "market_regime": self.market_regime,
             "peg": peg,
-            "m_cap": m_cap
+            "m_cap": m_cap,
+            "ev_ebitda": ev_ebitda, 
+            "fcf_yield": fcf_yield,
+            "roic": roic
         }
 
 # --- 4. Bot Setup ---
@@ -272,8 +254,8 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v2.4] 机构级估值模型 (修复 PEG 读取)")
-@app_commands.describe(ticker="股票代码 (如 AAPL)")
+@bot.tree.command(name="analyze", description="[v2.6] 机构级估值模型 (优化布局)")
+@app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
     
@@ -305,15 +287,26 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     
-    # 核心特征 (含 PEG)
     peg_display = format_num(data['peg']) if data['peg'] else "N/A"
-    embed.add_field(name="核心特征", value=f"Beta: {format_num(beta_val)} ({beta_desc})\nPEG: {peg_display} (成长性价比)", inline=False)
+    ev_display = format_num(data['ev_ebitda']) if data['ev_ebitda'] else "N/A"
+    fcf_display = format_percent(data['fcf_yield']) if data['fcf_yield'] else "N/A"
+    roic_display = format_percent(data['roic']) if data['roic'] else "N/A"
+
+    # --- 布局调整: EV/EBITDA 提到第一行 ---
+    core_factors = (
+        f"**EV/EBITDA:** {ev_display}\n"
+        f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
+        f"**PEG:** {peg_display} (成长性价比)\n"
+        f"**FCF Yield:** {fcf_display}\n"
+        f"**ROIC:** {roic_display}"
+    )
+    embed.add_field(name="核心特征", value=core_factors, inline=False)
 
     if model.logs:
         log_str = "\n".join([f"- {log}" for log in model.logs])
         embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
 
-    embed.set_footer(text="Model v2.4 | PEG Data Fixed")
+    embed.set_footer(text="模型建议，仅作参考 | Model v2.6")
 
     await interaction.followup.send(embed=embed)
 
