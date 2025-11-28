@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.1 Ultimate) ---
+# --- 3. 估值判断模型 (v6.2 Final Logic) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -163,7 +163,7 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 (v6.1 Refined) ---
+        # --- Meme/信仰值模型 (v6.2 Dynamic Labels) ---
         meme_score = 0
         
         # 1. 价格趋势 (FOMO): 偏离年线 (Max 2)
@@ -172,11 +172,8 @@ class ValuationModel:
             elif price > price_200ma * 1.15: meme_score += 1
             
         # 2. 极致估值 (Hype): 区分普通贵和离谱贵 (Max 4)
-        # TSLA (103x) 会命中 +4，NVDA (38x) 命中 +1 或 +2
-        is_insane_val = False
         if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): 
             meme_score += 4
-            is_insane_val = True
         elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): 
             meme_score += 2
         elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): 
@@ -187,7 +184,7 @@ class ValuationModel:
         elif beta > 1.3: meme_score += 1
             
         # 4. 现实扭曲因子 (Distortion): 越烂越涨 (Max 2)
-        # 如果股价在高位 (大于年线)，但 FCF 极差 (<1%) 或 PEG 崩坏 (<0 或 >4)
+        # 股价在高位但基本面崩坏
         if price and price_200ma and price > price_200ma:
             bad_fcf = (fcf_yield is not None and fcf_yield < 0.01)
             bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
@@ -198,7 +195,6 @@ class ValuationModel:
         if vol_today and vol_avg and vol_avg > 0:
             if vol_today > vol_avg * 1.2: meme_score += 1
         
-        # 满分限制 10 分
         meme_score = min(10, meme_score)
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 60
@@ -305,20 +301,16 @@ class ValuationModel:
             self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
 
         # --- 策略修正层 (v6.0 Strategy) ---
-        
-        # 1. 周期性陷阱
         if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
             self.strategy = "看似估值极低，但营收处于萎缩周期，需警惕'低估值陷阱'。"
             lt_status = "周期性风险"
             self.logs.append(f"[陷阱] PE ({format_num(pe)}) 虽低，但营收负增长 ({format_percent(rev_growth)})，疑似周期顶部。")
 
-        # 2. 防御性资产
         elif beta and beta < 0.6 and fcf_yield and fcf_yield > 0.03 and "陷阱" not in self.strategy:
             self.strategy = "低波动防御性资产，适合作为市场震荡时的避险配置。"
             lt_status = "防御/收息"
             self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备债性特征。")
 
-        # 3. 困境反转
         if net_margin and net_margin < 0:
             if len(recent) >= 3:
                 beats_check = sum(1 for x in recent if x["act"] > x["est"])
@@ -355,7 +347,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v6.1] 估值分析 (Meme重构+策略补全)")
+@bot.tree.command(name="analyze", description="[v6.2] 估值分析 (Meme分级优化版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -388,10 +380,17 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
+    # [核心修改] 动态信仰评级
+    meme_pct = data['meme_pct']
+    meme_desc = "冷门资产"
+    if meme_pct >= 80: meme_desc = "狂热宗教"
+    elif meme_pct >= 60: meme_desc = "散户信仰"
+    elif meme_pct >= 30: meme_desc = "机构共识"
+    
     core_factors = (
         f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
         f"**PEG:** {peg_display} ({data['growth_desc']})\n"
-        f"**Meme值:** {data['meme_pct']}% (散户信仰)"
+        f"**Meme值:** {meme_pct}% ({meme_desc})"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
