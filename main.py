@@ -62,19 +62,46 @@ def format_market_cap(num):
     return f"${num/1e6:.2f}M"
 
 # --- 2. 行业基准 ---
+# [保留] 作为动态获取失败时的安全回落 (Fallback)
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0, "Consumer Electronics": 25.0, "Communication Services": 20.0,
     "Healthcare": 18.0, "Financial Services": 12.0, "Energy": 10.0,
     "Utilities": 12.0, "Unknown": 18.0
 }
 
-def get_sector_benchmark(sector):
+# [修改] 新增函数：动态获取 EV/EBITDA 行业中位数
+def fetch_dynamic_sector_benchmark(sector):
+    if not sector or sector == "Unknown": return None
+    
+    # 使用 V3 接口获取 TTM Key Metrics 的行业中位数
+    url = f"{V3_URL}/key-metrics/industry-median?sector={sector}&apikey={FMP_API_KEY}"
+    try:
+        logger.info(f"📡 Requesting Sector Median for: {sector}")
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data and data[0].get("enterpriseValueOverEBITDATTM"):
+                median_value = data[0]["enterpriseValueOverEBITDATTM"]
+                logger.info(f"✅ Dynamic Median for {sector}: {median_value:.2f}")
+                return median_value
+        logger.warning(f"⚠️ FMP returned no valid dynamic median data for {sector}.")
+        return None
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to fetch dynamic median for {sector}. Error: {e}")
+        return None
+
+# [修改] 简化后的回落函数
+def get_sector_benchmark(sector, dynamic_median=None):
+    if dynamic_median is not None:
+        return dynamic_median
+    
+    # 使用硬编码回落
     if not sector: return 18.0
-    for key in SECTOR_EBITDA_MEDIAN:
-        if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
+    for key, value in SECTOR_EBITDA_MEDIAN.items():
+        if key.lower() in str(sector).lower(): return value
     return 18.0
 
-# --- 3. 估值判断模型 (v6.8.1 Wording Fix) ---
+# --- 3. 估值判断模型 (v6.10 Enhanced Data Transparency) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -87,13 +114,30 @@ class ValuationModel:
         self.logs = [] 
         self.flags = [] 
         self.strategy = "数据不足" 
+        self.sector = "Unknown" # 存储 sector
 
     async def fetch_data(self):
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
         loop = asyncio.get_event_loop()
+        
+        # 步骤 1: 异步获取 profile 和 quote (需要 sector)
         tasks = {
             "profile": loop.run_in_executor(None, get_fmp_data, "profile", self.ticker, ""),
             "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
+        }
+        results = await asyncio.gather(*tasks.values())
+        self.data.update(dict(zip(tasks.keys(), results)))
+        
+        if self.data["profile"]:
+            self.sector = self.data["profile"].get("sector", "Unknown")
+
+        # 步骤 2: 获取动态行业中位数
+        median_task = loop.run_in_executor(None, fetch_dynamic_sector_benchmark, self.sector)
+        dynamic_median = await median_task
+        self.data["sector_median"] = dynamic_median # 存储中位数结果
+        
+        # 步骤 3: 获取剩余数据
+        tasks = {
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
@@ -101,7 +145,8 @@ class ValuationModel:
             "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
         }
         results = await asyncio.gather(*tasks.values())
-        self.data = dict(zip(tasks.keys(), results))
+        self.data.update(dict(zip(tasks.keys(), results)))
+
         return self.data["profile"] is not None and self.data["quote"] is not None
 
     def analyze(self):
@@ -118,26 +163,69 @@ class ValuationModel:
         price_200ma = q.get("priceAvg200")
         vol_today = q.get("volume")
         vol_avg = q.get("avgVolume")
-        sector = p.get("sector", "Unknown")
+        sector = self.sector
         beta = p.get("beta")
         if beta is None: beta = 1.0 
         
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap", 0)
+        
+        # --- 核心指标定义与数据完整性检查 ---
+        
+        # 1. Main Valuation Ratios
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
         fcf_yield = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM")
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
         ps_ratio = r.get("priceToSalesRatioTTM")
-        
-        # PEG 计算
-        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
+        
+        # 2. Growth Ratios
+        peg_status = "N/A"
+        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         ni_growth = m.get("netIncomeGrowthTTM")
         rev_growth = m.get("revenueGrowthTTM")
 
+        # --- 数据缺失/回落 状态日志 ---
+        
+        # a) 动态行业基准状态
+        sector_median = self.data.get("sector_median")
+        sector_avg = get_sector_benchmark(sector, sector_median)
+        
+        if sector_median is not None:
+            self.logs.append(f"[基准] 使用动态 EV/EBITDA 行业中位数: **{sector_median:.2f}** ({sector})")
+        else:
+            self.logs.append(f"[基准] 动态基准获取失败，使用硬编码回落 ({sector}): **{sector_avg:.2f}**")
+
+        # b) 核心估值指标缺失
+        missing_metrics = []
+        if ev_ebitda is None: missing_metrics.append("EV/EBITDA")
+        if fcf_yield is None: missing_metrics.append("FCF Yield")
+        if roic is None: missing_metrics.append("ROIC")
+        if net_margin is None: missing_metrics.append("Net Margin")
+        
+        if missing_metrics:
+            self.logs.append(f"[核心缺失] 估值模型缺少关键指标: {', '.join(missing_metrics)}。部分分析将跳过。")
+            # 如果缺少 FCF Yield，提前设置策略为数据不足
+            if "FCF Yield" in missing_metrics and self.strategy == "数据不足":
+                 self.strategy = "关键长期价值指标缺失，无法形成明确的估值倾向。"
+
+        # c) PEG 补全状态
         if peg is None and pe and ni_growth and ni_growth > 0:
-            try: peg = pe / (ni_growth * 100)
-            except: pass
+            try: 
+                peg = pe / (ni_growth * 100)
+                peg_status = "Derived"
+                self.logs.append(f"[数据补全] PEG ({format_num(peg)}) 为 PE/NI Growth 估算值，非 FMP 原始数据。")
+            except: 
+                peg_status = "N/A"
+        elif peg is not None:
+            peg_status = "Fetched"
+        else:
+            # PEG 缺失，且无法计算
+            if "PEG" not in missing_metrics:
+                self.logs.append(f"[数据缺失] 缺少 PEG, PE, 或净利润增长数据。成长评估指标缺失。")
+            peg_status = "N/A"
+            
+        # --- 增长率计算 (依赖 PEG) ---
 
         implied_growth = 0
         if peg and pe and peg > 0:
@@ -152,7 +240,7 @@ class ValuationModel:
         elif max_growth > 0.05: growth_desc = "稳健"
         if peg and peg > 3.0: growth_desc = "高预期"
 
-        # VIX 分析
+        # --- VIX 分析 (不变) ---
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
@@ -163,7 +251,7 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 ---
+        # --- Meme/信仰值模型 (不变) ---
         meme_score = 0
         
         # 1. 价格趋势
@@ -203,7 +291,6 @@ class ValuationModel:
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 60
 
-        sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
         # --- 短期估值逻辑 ---
@@ -280,8 +367,7 @@ class ValuationModel:
                     self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
                     if lt_status == "中性": lt_status = "优质"
             
-            if fcf_yield is None:
-                if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
+            # Note: 缺少 FCF Yield 的情况已在数据完整性检查中处理
 
         # D. Alpha 信号
         valid_earnings = []
@@ -418,7 +504,11 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     # [排版] 因子分析：使用 \n> \n 来连接，制造连贯的竖线
     log_content = []
     if model.flags: log_content.extend(model.flags) 
-    log_content.extend([f"{log}" for log in model.logs])
+    # 将所有日志（包括数据状态日志）都加入
+    log_content.extend([f"{log}" for log in model.logs]) 
+    
+    # 策略单独处理
+    strategy_text = f"**[策略]** {model.strategy}"
     
     formatted_logs = []
     for log in log_content:
@@ -427,18 +517,17 @@ async def analyze(interaction: discord.Interaction, ticker: str):
             tag_end = log.find("]") + 1
             tag = log[:tag_end]
             content = log[tag_end:]
-            # 注意：这里我们给每一行都加 >，稍后在join时中间加带>的空行
-            formatted_logs.append(f"> **{tag}**{content}")
+            formatted_logs.append(f"**{tag}**{content}")
         else:
-            formatted_logs.append(f"> {log}")
+            formatted_logs.append(log)
 
-    # [核心技巧] 使用 \n> \n 连接，这样空行也会被引用，竖线就不断了
-    factor_str = "\n> \n".join(formatted_logs)
+    # [核心技巧] 构造连续竖线
+    # 1. 对每一行内容加 Quote
+    quoted_factors = [f"> {log}" for log in formatted_logs]
+    # 2. 用带 Quote 的空行连接，保证竖线不断
+    factor_str = "\n> \n".join(quoted_factors)
     
-    # 策略单独放在引用块外面，不加 > 
-    strategy_text = f"**[策略]** {model.strategy}"
-    
-    # 组合：因子引用块 + 双换行 + 策略
+    # 组合：因子引用块 + 双换行 + 策略（策略不加引用）
     full_log_str = f"{factor_str}\n\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
