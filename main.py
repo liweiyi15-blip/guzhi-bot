@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.2 Final Logic) ---
+# --- 3. 估值判断模型 (v6.3 Precision Fix) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -163,15 +163,15 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 (v6.2 Dynamic Labels) ---
+        # --- Meme/信仰值模型 (v6.3 Smart Fix) ---
         meme_score = 0
         
-        # 1. 价格趋势 (FOMO): 偏离年线 (Max 2)
+        # 1. 价格趋势 (FOMO)
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
             
-        # 2. 极致估值 (Hype): 区分普通贵和离谱贵 (Max 4)
+        # 2. 极致估值 (Hype)
         if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): 
             meme_score += 4
         elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): 
@@ -179,50 +179,69 @@ class ValuationModel:
         elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): 
             meme_score += 1
             
-        # 3. 波动率 (Action): (Max 2)
+        # 3. 波动率 (Action)
         if beta > 2.0: meme_score += 2
         elif beta > 1.3: meme_score += 1
             
-        # 4. 现实扭曲因子 (Distortion): 越烂越涨 (Max 2)
-        # 股价在高位但基本面崩坏
+        # 4. 现实扭曲因子 (Distortion)
         if price and price_200ma and price > price_200ma:
             bad_fcf = (fcf_yield is not None and fcf_yield < 0.01)
             bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
             if bad_fcf or bad_peg:
                 meme_score += 2
             
-        # 5. 人群聚集 (Crowd): 放量 (Max 1)
+        # 5. 人群聚集 (Crowd)
         if vol_today and vol_avg and vol_avg > 0:
             if vol_today > vol_avg * 1.2: meme_score += 1
         
-        meme_score = min(10, meme_score)
+        # [核心修复] 业绩护盾 (Quality Shield)
+        # 如果是 NVDA 这种真金白银的业绩，Meme 分数要大打折扣
+        if roic and roic > 0.20:
+             # 高 ROIC 且 PEG 合理，说明高波动是因为机构在抢筹，不是散户瞎炒
+            if peg and 0 < peg < 3.0: 
+                meme_score -= 3
+            # 即使稍微贵点，ROIC 极高也应该减分
+            else: 
+                meme_score -= 1
+        
+        # 限制分数范围
+        meme_score = max(0, min(10, meme_score))
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 60
 
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
-        # 短期估值逻辑
-        if ev_ebitda is not None:
-            ratio = ev_ebitda / sector_avg
-            if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
-                st_status = "便宜 (高成长)"
-                self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
-            elif ratio < 0.7:
-                st_status = "便宜"
-                self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
-            elif ratio > 1.3:
-                if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 2.0):
-                     st_status = "合理溢价"
-                     self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
+        # --- 短期估值逻辑 (含亏损熔断) ---
+        
+        # [核心修复] 亏损熔断：如果公司在亏钱，EV/EBITDA 再低也不能叫便宜
+        is_distressed = False
+        if (net_margin is not None and net_margin < -0.05) or (fcf_yield is not None and fcf_yield < -0.02):
+            is_distressed = True
+            st_status = "基本面恶化"
+            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效，警惕低估值陷阱。")
+        
+        if not is_distressed:
+            if ev_ebitda is not None:
+                ratio = ev_ebitda / sector_avg
+                if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
+                    st_status = "便宜 (高成长)"
+                    self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
+                elif ratio < 0.7:
+                    st_status = "便宜"
+                    self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
+                elif ratio > 1.3:
+                    if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 2.0):
+                        st_status = "合理溢价"
+                        self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
+                    else:
+                        st_status = "昂贵"
+                        self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 远高于行业均值 ({sector_avg})，且缺乏增长支撑。")
                 else:
-                    st_status = "昂贵"
-                    self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 远高于行业均值 ({sector_avg})，且缺乏增长支撑。")
+                    st_status = "估值合理"
+                    self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
             else:
-                st_status = "估值合理"
-                self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
-        else:
-             self.logs.append(f"[板块] 缺少 EV/EBITDA 数据，无法对比。")
+                self.logs.append(f"[板块] 缺少 EV/EBITDA 数据，无法对比。")
         
         self.short_term_verdict = st_status
 
@@ -347,7 +366,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v6.2] 估值分析 (Meme分级优化版)")
+@bot.tree.command(name="analyze", description="[v6.3] 估值分析 (陷阱识别+业绩护盾)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -380,7 +399,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
-    # [核心修改] 动态信仰评级
+    # 动态信仰评级
     meme_pct = data['meme_pct']
     meme_desc = "冷门资产"
     if meme_pct >= 80: meme_desc = "狂热宗教"
