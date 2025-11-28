@@ -15,7 +15,7 @@ FMP_API_KEY = os.getenv('FMP_API_KEY')
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 
-# --- 日志配置 ---
+# --- 日志配置 (确保 Railway 能看到) ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -32,17 +32,14 @@ def get_fmp_data(endpoint, ticker, params=""):
     try:
         logger.info(f"📡 Requesting: {safe_url}")
         response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-             logger.error(f"❌ API Failed: {response.status_code} for {endpoint}")
-             return None
-        
+        if response.status_code != 200: 
+            logger.error(f"❌ API Error {response.status_code} for {endpoint}")
+            return None
         data = response.json()
-        
         if isinstance(data, list) and "historical" not in endpoint:
-            if len(data) > 0:
-                return data[0]
-            else:
+            if len(data) > 0: return data[0]
+            else: 
+                logger.warning(f"⚠️ Empty list returned for {endpoint}")
                 return None
         return data
     except Exception as e:
@@ -53,9 +50,12 @@ def get_fmp_list_data(endpoint, ticker, limit=4):
     url = f"{BASE_URL}/{endpoint}/{ticker}?apikey={FMP_API_KEY}&limit={limit}"
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code != 200: return []
+        if response.status_code != 200: 
+            logger.error(f"❌ API Error {response.status_code} for list {endpoint}")
+            return []
         return response.json()
-    except:
+    except Exception as e:
+        logger.error(f"❌ Exception fetching list {endpoint}: {e}")
         return []
 
 def format_percent(num):
@@ -84,7 +84,7 @@ def get_sector_benchmark(sector):
         if key in sector: return val
     return 18.0
 
-# --- 3. 估值判断模型 (v3.2) ---
+# --- 3. 估值判断模型 (v3.4) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -98,7 +98,7 @@ class ValuationModel:
         
         self.logs = [] 
         self.flags = [] 
-        self.strategy = "数据不足，难以评价" # 默认评价
+        self.strategy = "数据不足" 
 
     async def fetch_data(self):
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
@@ -115,7 +115,12 @@ class ValuationModel:
         results = await asyncio.gather(*tasks.values())
         self.data = dict(zip(tasks.keys(), results))
         
-        return self.data["profile"] is not None and self.data["quote"] is not None
+        # 基础数据检查
+        has_basic = self.data["profile"] is not None and self.data["quote"] is not None
+        if not has_basic:
+            logger.error(f"❌ CRITICAL: Basic Profile/Quote data missing for {self.ticker}")
+        
+        return has_basic
 
     def analyze(self):
         p = self.data.get("profile", {}) or {}
@@ -140,26 +145,45 @@ class ValuationModel:
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
         
-        # PEG 处理
+        # PEG 与成长
         peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
-        ni_growth = m.get("netIncomeGrowthTTM")
         pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
+        ni_growth = m.get("netIncomeGrowthTTM")
+        rev_growth = m.get("revenueGrowthTTM")
+
+        # ---------------------------------------------------------
+        # 🔍 后台数据审计 (Data Audit) - 永久显示在 Railway Logs
+        # ---------------------------------------------------------
+        missing_fields = []
+        if not m_cap: missing_fields.append("Market Cap")
+        if not ev_ebitda: missing_fields.append("EV/EBITDA")
+        if not fcf_yield: missing_fields.append("FCF Yield")
+        if not roic: missing_fields.append("ROIC")
+        if not peg and not (pe and ni_growth): missing_fields.append("PEG & Growth Data")
+        if not earnings: missing_fields.append("Earnings Surprises")
         
-        if peg is None:
-            if pe and ni_growth:
-                if ni_growth > 0.01:
-                    peg = pe / (ni_growth * 100)
-                    self.logs.append(f"[数据] 手算 PEG: {format_num(peg)} (增长率 {format_percent(ni_growth)})")
+        if missing_fields:
+            logger.warning(f"⚠️ [DATA MISSING] {self.ticker}: The following fields are missing: {', '.join(missing_fields)}")
+        else:
+            logger.info(f"✅ [DATA HEALTHY] {self.ticker}: All core valuation fields retrieved successfully.")
+        # ---------------------------------------------------------
+
+        # PEG 手算兜底
+        if peg is None and pe and ni_growth and ni_growth > 0:
+            try: peg = pe / (ni_growth * 100)
+            except: pass
+
+        # 隐含成长率反推
+        implied_growth = 0
+        if peg and pe and peg > 0:
+            implied_growth = (pe / peg) / 100.0
 
         # 成长分层
+        max_growth = max(filter(None, [rev_growth, ni_growth, implied_growth])) if any([rev_growth, ni_growth, implied_growth]) else 0
         growth_desc = "低成长"
-        rev_growth = m.get("revenueGrowthTTM")
-        if (rev_growth and rev_growth > 0.5) or (ni_growth and ni_growth > 0.5):
-            growth_desc = "超高速"
-        elif (rev_growth and rev_growth > 0.2) or (ni_growth and ni_growth > 0.2):
-            growth_desc = "高速"
-        elif (rev_growth and rev_growth > 0.05):
-            growth_desc = "稳健"
+        if max_growth > 0.5: growth_desc = "超高速"
+        elif max_growth > 0.2: growth_desc = "高速"
+        elif max_growth > 0.05: growth_desc = "稳健"
 
         # --- 0. 市场情绪 ---
         vix = vix_data.get("price", 20)
@@ -199,50 +223,43 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 3. 长期估值与策略评价 ---
+        # --- 3. 长期估值与策略 ---
         lt_status = "中性"
         is_value_trap = False
 
-        # 💀【价值陷阱检测】
+        # 陷阱检测
         if net_margin and net_margin < 0 and price_200ma and price < price_200ma:
             is_value_trap = True
             lt_status = "风险极大"
             st_status = "下跌趋势"
             self.logs.append(f"[风险] 公司长期亏损且股价位于年线下方，看似低估实为“价值陷阱”。")
-            self.strategy = "⚠️ 趋势与基本面双弱，需警惕'接飞刀'风险" # 客观风险提示
+            self.strategy = "趋势与基本面双弱，需警惕'接飞刀'风险"
         
-        # 正常逻辑
         if not is_value_trap:
             if fcf_yield:
-                # 场景 A: 优质溢价 (NVDA类型)
                 if fcf_yield < 0.025 and roic and roic > 0.20:
                     lt_status = "优质/值得等待"
                     self.logs.append(f"[辩证] FCF Yield 虽低，但 ROIC ({format_percent(roic)}) 极高，属于'优质溢价'。")
-                    self.strategy = "💎 优质资产通常溢价较高，估值回归时具备更高吸引力"
-                
-                # 场景 B: 便宜 (Value)
+                    self.strategy = "此类资产通常不会便宜，适合分批配置或等待回调。"
                 elif fcf_yield > 0.04:
                     lt_status = "便宜"
                     self.logs.append(f"[价值] FCF Yield {format_percent(fcf_yield)} 丰厚，提供良好安全垫。")
-                    self.strategy = "✅ 当前价格低于内在价值，具备较好的安全边际"
-                
-                # 场景 C: 昂贵 (无成长)
+                    self.strategy = "当前价格具备较好的安全边际。"
                 elif fcf_yield < 0.02:
                     lt_status = "昂贵"
                     if "高速" in growth_desc:
                          self.logs.append(f"[价值] FCF Yield 较低，当前估值高度依赖未来高增长兑现。")
-                         self.strategy = "⚖️ 估值包含较高增长预期，股价波动可能随业绩剧烈放大"
+                         self.strategy = "估值包含较高增长预期，股价波动可能随业绩剧烈放大。"
                     else:
                         self.logs.append(f"[价值] FCF Yield 极低且无增长，隐含预期过高，风险较大。")
-                        self.strategy = "⛔️ 风险收益比不佳，当前估值缺乏基本面支撑"
+                        self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑。"
             
-                # 护城河加分
                 if roic and roic > 0.15 and lt_status not in ["优质/值得等待", "昂贵"]:
                     self.logs.append(f"[护城河] ROIC {format_percent(roic)} 优秀，资本效率高。")
                     if lt_status == "中性": lt_status = "优质"
             
             if not fcf_yield:
-                self.strategy = "👀 当前数据不足以形成明确的估值倾向"
+                self.strategy = "当前数据不足以形成明确的估值倾向。"
 
         # D. Alpha 信号
         if not is_value_trap and earnings and isinstance(earnings, list):
@@ -285,7 +302,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v3.2] 估值分析 (客观评价版)")
+@bot.tree.command(name="analyze", description="[v3.4] 估值分析 (后台审计版)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -331,8 +348,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     if model.flags: log_content.extend(model.flags) 
     log_content.extend([f"- {log}" for log in model.logs])
     
-    # 策略显示在因子分析底部
-    log_content.append(f"\n[策略] {model.strategy}") 
+    log_content.append(f"\n- [策略] {model.strategy}") 
 
     if log_content:
         log_str = "\n".join(log_content)
