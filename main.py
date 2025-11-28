@@ -6,6 +6,7 @@ import os
 import asyncio
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
 
 # 加载环境变量
 load_dotenv()
@@ -37,10 +38,11 @@ def get_fmp_data(endpoint, ticker, params=""):
         if isinstance(data, list) and "historical" not in endpoint:
             return data[0] if len(data) > 0 else None
         return data
-    except: return None
+    except Exception as e:
+        logger.error(f"Error fetching {endpoint}: {e}")
+        return None
 
 def get_earnings_data(ticker):
-    # [核心修复] 切换回 stable/earnings 接口，并扩大 limit 以跳过未来数据
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     try:
         response = requests.get(url, timeout=10)
@@ -67,11 +69,12 @@ SECTOR_EBITDA_MEDIAN = {
 }
 
 def get_sector_benchmark(sector):
+    if not sector: return 18.0
     for key in SECTOR_EBITDA_MEDIAN:
-        if key in str(sector): return SECTOR_EBITDA_MEDIAN[key]
+        if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v5.6) ---
+# --- 3. 估值判断模型 (v6.1 Ultimate) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -106,7 +109,6 @@ class ValuationModel:
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
-        bs = self.data.get("bs", {}) or {}
         vix_data = self.data.get("vix", {}) or {}
         earnings = self.data.get("earnings", []) or []
         
@@ -114,8 +116,11 @@ class ValuationModel:
 
         price = q.get("price")
         price_200ma = q.get("priceAvg200")
+        vol_today = q.get("volume")
+        vol_avg = q.get("avgVolume")
         sector = p.get("sector", "Unknown")
-        beta = p.get("beta", 1.0)
+        beta = p.get("beta")
+        if beta is None: beta = 1.0 
         
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap", 0)
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
@@ -124,15 +129,11 @@ class ValuationModel:
         net_margin = r.get("netProfitMarginTTM")
         ps_ratio = r.get("priceToSalesRatioTTM")
         
-        # PEG
+        # PEG 计算
         peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
         pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
         ni_growth = m.get("netIncomeGrowthTTM")
         rev_growth = m.get("revenueGrowthTTM")
-
-        # 审计
-        if not peg and not (pe and ni_growth):
-             logger.warning(f"⚠️ [DATA MISSING] PEG data not found for {self.ticker}")
 
         if peg is None and pe and ni_growth and ni_growth > 0:
             try: peg = pe / (ni_growth * 100)
@@ -142,7 +143,8 @@ class ValuationModel:
         if peg and pe and peg > 0:
             implied_growth = (pe / peg) / 100.0
 
-        max_growth = max(filter(None, [rev_growth, ni_growth, implied_growth])) if any([rev_growth, ni_growth, implied_growth]) else 0
+        growth_list = [x for x in [rev_growth, ni_growth, implied_growth] if x is not None]
+        max_growth = max(growth_list) if growth_list else 0
         
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
@@ -150,41 +152,71 @@ class ValuationModel:
         elif max_growth > 0.05: growth_desc = "稳健"
         if peg and peg > 3.0: growth_desc = "高预期"
 
+        # VIX 分析
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
         else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
+        # 风险计算
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # Meme
+        # --- Meme/信仰值模型 (v6.1 Refined) ---
         meme_score = 0
-        if beta and beta > 2.0: meme_score += 2
-        elif beta and beta > 1.3: meme_score += 1
-        if price and price_200ma:
-            if price > price_200ma * 1.5: meme_score += 3
-            elif price > price_200ma * 1.2: meme_score += 1
-        if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 50): meme_score += 2
-        elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 30): meme_score += 1
         
-        meme_pct = min(100, int((meme_score / 7.0) * 100))
-        is_faith_mode = meme_pct >= 70
+        # 1. 价格趋势 (FOMO): 偏离年线 (Max 2)
+        if price and price_200ma:
+            if price > price_200ma * 1.4: meme_score += 2
+            elif price > price_200ma * 1.15: meme_score += 1
+            
+        # 2. 极致估值 (Hype): 区分普通贵和离谱贵 (Max 4)
+        # TSLA (103x) 会命中 +4，NVDA (38x) 命中 +1 或 +2
+        is_insane_val = False
+        if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): 
+            meme_score += 4
+            is_insane_val = True
+        elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): 
+            meme_score += 2
+        elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): 
+            meme_score += 1
+            
+        # 3. 波动率 (Action): (Max 2)
+        if beta > 2.0: meme_score += 2
+        elif beta > 1.3: meme_score += 1
+            
+        # 4. 现实扭曲因子 (Distortion): 越烂越涨 (Max 2)
+        # 如果股价在高位 (大于年线)，但 FCF 极差 (<1%) 或 PEG 崩坏 (<0 或 >4)
+        if price and price_200ma and price > price_200ma:
+            bad_fcf = (fcf_yield is not None and fcf_yield < 0.01)
+            bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
+            if bad_fcf or bad_peg:
+                meme_score += 2
+            
+        # 5. 人群聚集 (Crowd): 放量 (Max 1)
+        if vol_today and vol_avg and vol_avg > 0:
+            if vol_today > vol_avg * 1.2: meme_score += 1
+        
+        # 满分限制 10 分
+        meme_score = min(10, meme_score)
+        meme_pct = int(meme_score * 10)
+        is_faith_mode = meme_pct >= 60
 
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
-        if ev_ebitda:
+        # 短期估值逻辑
+        if ev_ebitda is not None:
             ratio = ev_ebitda / sector_avg
-            if ("高速" in growth_desc or "预期" in growth_desc) and peg and peg < 1.5:
+            if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
                 st_status = "便宜 (高成长)"
                 self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
             elif ratio < 0.7:
                 st_status = "便宜"
                 self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
             elif ratio > 1.3:
-                if ("高速" in growth_desc or "预期" in growth_desc) and peg and peg < 2.0:
+                if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 2.0):
                      st_status = "合理溢价"
                      self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
                 else:
@@ -202,7 +234,7 @@ class ValuationModel:
         lt_status = "中性"
         is_value_trap = False
 
-        if net_margin and net_margin < 0 and price_200ma and price < price_200ma:
+        if net_margin is not None and net_margin < 0 and price_200ma and price < price_200ma:
             is_value_trap = True
             lt_status = "风险极大"
             st_status = "下跌趋势"
@@ -211,12 +243,12 @@ class ValuationModel:
         
         if not is_value_trap:
             if is_faith_mode:
-                self.logs.insert(0, f"[信仰] 股价强势运行于年线之上，散户狂热叠加机构抱团，做多情绪已凝聚成强烈的“资金共识”。")
+                self.logs.insert(0, f"[信仰] Meme值 {meme_pct}%。股价脱离基本面引力，进入“纯资金博弈”模式。")
                 if "昂贵" in st_status: st_status += " / 资金博弈"
                 if "昂贵" in lt_status: lt_status = "高溢价 (信仰支撑)"
                 self.strategy = "基本面内含极高预期，但资金动量主导短期走势。顺势交易需严设止损。"
 
-            if fcf_yield:
+            if fcf_yield is not None:
                 fcf_str = format_percent(fcf_yield)
                 if fcf_yield < 0.025 and roic and roic > 0.20:
                     if not is_faith_mode:
@@ -236,37 +268,64 @@ class ValuationModel:
                         self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无增长，隐含预期过高，风险较大。")
                         if not is_faith_mode: self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑。"
             
-                if roic and roic > 0.15 and "昂贵" not in lt_status:
+                if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
                     self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
                     if lt_status == "中性": lt_status = "优质"
             
-            if not fcf_yield:
+            if fcf_yield is None:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        # D. Alpha 信号 (强制显示逻辑)
+        # D. Alpha 信号 (v5.8 Time-Aware)
         valid_earnings = []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         if isinstance(earnings, list):
             for e in earnings:
-                # 兼容 stable/earnings 接口的字段
                 est = e.get("epsEstimated")
                 act = e.get("epsActual")
-                if est is not None and act is not None:
-                    valid_earnings.append({"est": est, "act": act})
+                date = e.get("date")
+                if est is not None and act is not None and date is not None:
+                    if date < today_str:
+                        valid_earnings.append({"est": est, "act": act, "date": date})
         
-        # 只取前4个有效历史数据
+        valid_earnings.sort(key=lambda x: x["date"], reverse=True)
         recent = valid_earnings[:4]
         
         if len(recent) > 0:
             beats = sum(1 for x in recent if x["act"] > x["est"])
             total = len(recent)
             beat_rate = beats / total
+            last_report_date = recent[0]['date']
+            
             if beat_rate >= 0.75:
-                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
+                self.logs.append(f"[Alpha] 截至 {last_report_date}，过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
             else:
-                self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
+                self.logs.append(f"[Alpha] 截至 {last_report_date}，过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
         else:
-            # 兜底日志
-            self.logs.append(f"[Alpha] 暂无有效财报数据，无法判断业绩趋势。")
+            self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
+
+        # --- 策略修正层 (v6.0 Strategy) ---
+        
+        # 1. 周期性陷阱
+        if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
+            self.strategy = "看似估值极低，但营收处于萎缩周期，需警惕'低估值陷阱'。"
+            lt_status = "周期性风险"
+            self.logs.append(f"[陷阱] PE ({format_num(pe)}) 虽低，但营收负增长 ({format_percent(rev_growth)})，疑似周期顶部。")
+
+        # 2. 防御性资产
+        elif beta and beta < 0.6 and fcf_yield and fcf_yield > 0.03 and "陷阱" not in self.strategy:
+            self.strategy = "低波动防御性资产，适合作为市场震荡时的避险配置。"
+            lt_status = "防御/收息"
+            self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备债性特征。")
+
+        # 3. 困境反转
+        if net_margin and net_margin < 0:
+            if len(recent) >= 3:
+                beats_check = sum(1 for x in recent if x["act"] > x["est"])
+                if beats_check / len(recent) >= 0.75:
+                    self.strategy = "基本面虽处于亏损，但业绩连续超预期，关注'困境反转'机会。"
+                    lt_status = "观察/反转"
+                    self.logs.append(f"[反转] 尽管年度亏损，但近期业绩强劲，基本面可能有边际改善。")
 
         self.long_term_verdict = lt_status
 
@@ -296,7 +355,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v5.6] 估值分析 (Alpha强制版)")
+@bot.tree.command(name="analyze", description="[v6.1] 估值分析 (Meme重构+策略补全)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -327,7 +386,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
-    peg_display = format_num(data['peg']) if data['peg'] else "N/A"
+    peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
     core_factors = (
         f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
@@ -346,6 +405,7 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     if log_content:
         log_str = "\n".join(log_content)
+        if len(log_str) > 1000: log_str = log_str[:990] + "..."
         embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
 
     embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考")
