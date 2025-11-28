@@ -255,38 +255,36 @@ class ValuationModel:
             lt_status = "风险极大"
             st_status = "下跌趋势"
             self.logs.append(f"[风险] 公司长期亏损且股价位于年线下方，看似低估实为“价值陷阱”。")
-            self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险" # 非命令式
+            self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
             # --- 信仰模式 (Meme Score 50%+) 的细化分析 ---
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
-                    meme_log = f"[信仰] Meme值 {meme_pct}%。资金面开始主导，短期走势可能脱离传统估值。**关注资金流向。**"
-                    meme_strategy = "基本面开始失效，资金动量主导短期走势。交易行为高度依赖动量策略和止损管理。"
+                    meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
+                    meme_strategy = "价格波动性可能增加，交易决策可以结合市场动量指标。"
                 elif 60 <= meme_pct < 70:
-                    meme_log = f"[信仰] Meme值 {meme_pct}%。股价进入'散户信仰'支撑阶段，波动性极大。**存在高位震荡风险。**"
-                    meme_strategy = "基本面内含极高预期，资金动量主导短期走势。市场处于高不确定性，动量交易者需严格设置风险防范措施。"
+                    meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪高度活跃，体现出显著的**资金共识**和高流动性。"
+                    meme_strategy = "较高的关注度和交易量反映了市场的积极情绪，但应注意伴随的高波动性。"
                 elif 70 <= meme_pct < 80:
-                    meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪狂热，已形成**资金共识与基本面背离**。**潜在回调风险较高。**"
-                    meme_strategy = "估值泡沫特征明显，适合风险偏好极高的投机者，或等待极端回调后的观察机会。"
+                    meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，公司获得大量**关注溢价**，价格驱动力强劲。"
+                    meme_strategy = "估值中已包含极高的未来预期，投资行为应考虑资金潮退却的潜在风险。"
                 elif 80 <= meme_pct < 90:
-                    meme_log = f"[信仰] Meme值 {meme_pct}%。**狂热宗教模式**。估值已完全脱离基本面引力，仅剩博傻游戏。**风险等级极高。**"
-                    meme_strategy = "当前价格包含极高投机溢价，一旦资金抽离，跌幅将超出预期。谨慎评估风险。"
+                    meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪已进入非理性繁荣区间，价格体现出**极致的资金动能**。"
+                    meme_strategy = "此时价格驱动因素主要为情绪和资金流，应极为谨慎评估其风险收益比。"
                 elif meme_pct >= 90:
-                    meme_log = f"[信仰] Meme值 {meme_pct}%。**史诗级泡沫预警**。资金近乎疯狂，风险不可控。**应高度警惕。**"
-                    meme_strategy = "**严重风险预警。** 市场处于非理性繁荣，当前估值缺乏基本面逻辑支撑。"
+                    meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪处于顶峰，反映出**极强的短期向上动量**。"
+                    meme_strategy = "市场波动和回调风险已处于历史高位，对于中长期投资者而言，保持警惕性至关重要。"
 
                 self.logs.insert(0, meme_log)
-                if "昂贵" in st_status: st_status += " / 资金博弈"
-                if "昂贵" in lt_status: lt_status = "高溢价 (信仰支撑)"
+                if "昂贵" in st_status: st_status += " / 资金动量"
+                if "昂贵" in lt_status: lt_status = "高溢价 (资金动量)"
                 
-                # 策略修正
+                # 策略修正：这里不添加命令式警告
                 if self.strategy == "数据不足":
                     self.strategy = meme_strategy
-                elif not "风险" in self.strategy and not "动量交易" in self.strategy:
-                    self.strategy += f" **[额外警告] 现已进入资金主导模式，市场波动性增加，风险防范是关键。**"
-
-
+                # 移除了所有命令式的额外警告逻辑
+            # --- FCF/ROIC 逻辑 (保持不变) ---
             if fcf_yield is not None:
                 fcf_str = format_percent(fcf_yield)
                 if fcf_yield < 0.025 and roic and roic > 0.20:
@@ -314,7 +312,7 @@ class ValuationModel:
             if fcf_yield is None:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-            # D. Alpha 信号 (业绩超预期率)
+            # D. Alpha 信号 (保持不变)
             valid_earnings = []
             today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -342,7 +340,7 @@ class ValuationModel:
             else:
                 self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
 
-            # --- 策略修正层 ---
+            # --- 策略修正层 (保持不变) ---
             if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
                 self.strategy = "估值看似极低，但营收处于萎缩周期，需要警惕‘低估值陷阱’。"
                 lt_status = "周期性风险"
@@ -427,10 +425,10 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
     meme_pct = data['meme_pct']
-    meme_desc = "冷门资产"
-    if meme_pct >= 80: meme_desc = "狂热宗教"
-    elif meme_pct >= 60: meme_desc = "散户信仰"
-    elif meme_pct >= 30: meme_desc = "机构共识"
+    meme_desc = "低关注度"
+    if meme_pct >= 80: meme_desc = "资金狂热"
+    elif meme_pct >= 60: meme_desc = "高流动性"
+    elif meme_pct >= 30: meme_desc = "市场关注"
     
     core_factors = (
         f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
