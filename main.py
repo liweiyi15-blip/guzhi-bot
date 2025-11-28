@@ -17,7 +17,11 @@ FMP_API_KEY = os.getenv('FMP_API_KEY')
 BASE_URL = "https://financialmodelingprep.com/stable"
 V3_URL = "https://financialmodelingprep.com/api/v3"
 
-# --- 日志配置 ---
+# --- 全局状态 ---
+# 存储用户隐私偏好: {user_id: True/False}
+PRIVACY_MODE = {}
+
+# --- 日志配置 (保持不变) ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -82,7 +86,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 ---
+# --- 3. 估值判断模型 (保持不变) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -435,7 +439,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup (核心特征显示修正 + 脚注修改) ---
+# --- 4. Bot Setup (新增 /privacy 命令 + /analyze 隐私模式) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -450,21 +454,57 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
+# *** 新增 /privacy 命令 ***
+@bot.tree.command(name="privacy", description="切换隐私查询模式 (开启后分析结果仅自己可见)")
+async def privacy(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    # 默认关闭 (False)
+    is_on = PRIVACY_MODE.get(user_id, False)
+    
+    # 切换状态
+    new_state = not is_on
+    PRIVACY_MODE[user_id] = new_state
+    
+    status = "已开启 (查询结果仅自己可见)" if new_state else "已关闭 (查询结果公开)"
+    
+    await interaction.response.send_message(
+        f"✅ 隐私模式切换成功。\n当前状态: **{status}**",
+        ephemeral=True
+    )
+# *** /privacy 命令结束 ***
+
+
 @bot.tree.command(name="analyze", description="估值分析")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
-    await interaction.response.defer(thinking=True)
+    
+    is_privacy_mode = PRIVACY_MODE.get(interaction.user.id, False)
+    
+    # --- 隐私模式逻辑 ---
+    if is_privacy_mode:
+        # 1. 发送公开状态消息
+        await interaction.channel.send(f"正在查询 `{ticker.upper()}` 代码...")
+        
+        # 2. 延迟响应，并设置为仅自己可见 (ephemeral=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        ephemeral_result = True
+    else:
+        # 默认模式：公开延迟响应
+        await interaction.response.defer(thinking=True)
+        ephemeral_result = False
+    # --- 隐私模式逻辑结束 ---
     
     model = ValuationModel(ticker)
     success = await model.fetch_data()
     
     if not success:
-        await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=True)
+        # 使用 followup 发送错误消息，遵循 ephemeral 状态
+        await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
         return
 
     data = model.analyze()
     if not data:
-        await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=True)
+        await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=ephemeral_result)
         return
 
     # [排版] 标题
@@ -528,11 +568,12 @@ async def analyze(interaction: discord.Interaction, ticker: str):
 
     embed.add_field(name="因子分析", value=full_log_str, inline=False)
 
-    # *** 脚注修改 ***
+    # 脚注
     embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
-    # *** 脚注修改结束 ***
+    
 
-    await interaction.followup.send(embed=embed)
+    # *** Final Response: 使用 ephemeral_result 状态 ***
+    await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
