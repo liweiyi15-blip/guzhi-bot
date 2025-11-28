@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 数据工具函数 (保持不变) ---
+# --- 1. 数据工具函数 (已修复 requests.get 错误) ---
 
 def get_fmp_data(endpoint, ticker, params=""):
     """从 FMP API 获取数据"""
@@ -37,7 +37,8 @@ def get_fmp_data(endpoint, ticker, params=""):
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     try:
         logger.info(f"📡 Requesting: {safe_url}")
-        response = requests.requests.get(url, timeout=10)
+        # *** FIX: 使用正确的 requests.get ***
+        response = requests.get(url, timeout=10)
         if response.status_code != 200: 
             logger.warning(f"FMP API returned status {response.status_code} for {endpoint}")
             return None
@@ -53,9 +54,11 @@ def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     try:
-        response = requests.requests.get(url, timeout=10)
+        # *** FIX: 使用正确的 requests.get ***
+        response = requests.get(url, timeout=10)
         return response.json() if response.status_code == 200 else []
-    except: 
+    except Exception as e: 
+        logger.error(f"Error fetching earnings data: {e}")
         return []
 
 def format_percent(num):
@@ -439,7 +442,7 @@ class ValuationModel:
             "meme_pct": meme_pct 
         }
 
-# --- 4. Bot Setup (新增 /privacy 命令 + /analyze 隐私模式) ---
+# --- 4. Bot Setup (隐私模式命令 + analyze 命令) ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -454,7 +457,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-# *** 新增 /privacy 命令 ***
+# *** /privacy 命令 ***
 @bot.tree.command(name="privacy", description="切换隐私查询模式 (开启后分析结果仅自己可见)")
 async def privacy(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -482,14 +485,14 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     
     # --- 隐私模式逻辑 ---
     if is_privacy_mode:
-        # *** 修正后的公开状态消息 (新两行格式) ***
+        # 1. 发送公开状态消息 (新两行格式)
         public_message = (
             f"{interaction.user.mention} 开启 稳-量化估值系统\n"
             f"`{ticker.upper()}` 正在分析中⚡..."
         )
         await interaction.channel.send(public_message)
         
-        # 延迟响应，并设置为仅自己可见 (ephemeral=True)
+        # 2. 延迟响应，并设置为仅自己可见 (ephemeral=True)
         await interaction.response.defer(thinking=True, ephemeral=True)
         ephemeral_result = True
     else:
