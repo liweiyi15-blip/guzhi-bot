@@ -74,7 +74,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (v6.4 Text Polish) ---
+# --- 3. 估值判断模型 (v6.6 Final Logic) ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -163,7 +163,7 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
 
-        # --- Meme/信仰值模型 (v6.3 Logic) ---
+        # --- Meme/信仰值模型 ---
         meme_score = 0
         
         # 1. 价格趋势
@@ -206,14 +206,13 @@ class ValuationModel:
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
-        # --- 短期估值逻辑 (含亏损熔断) ---
+        # --- 短期估值逻辑 ---
         
-        # [核心修复] 亏损熔断
         is_distressed = False
         if (net_margin is not None and net_margin < -0.05) or (fcf_yield is not None and fcf_yield < -0.02):
             is_distressed = True
-            st_status = "极其昂贵" # [修改] 文案更直观
-            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效。") # [修改] 删掉废话
+            st_status = "极其昂贵"
+            self.logs.append(f"[预警] 净利率或现金流为负，EV/EBITDA 指标已失效。")
         
         if not is_distressed:
             if ev_ebitda is not None:
@@ -284,7 +283,7 @@ class ValuationModel:
             if fcf_yield is None:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
 
-        # D. Alpha 信号 (v6.4 No-Date)
+        # D. Alpha 信号
         valid_earnings = []
         today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -305,7 +304,6 @@ class ValuationModel:
             total = len(recent)
             beat_rate = beats / total
             
-            # [修改] 不显示具体日期，只显示结论
             if beat_rate >= 0.75:
                 self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
             else:
@@ -360,7 +358,7 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="analyze", description="[v6.4] 估值分析 (文案精修版)")
+@bot.tree.command(name="analyze", description="估值分析") # [修改] 简洁文案
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
@@ -377,23 +375,25 @@ async def analyze(interaction: discord.Interaction, ticker: str):
         await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=True)
         return
 
+    # [排版] 标题
     embed = discord.Embed(
         title=f"估值分析: {ticker.upper()}",
         description=f"现价: ${data['price']:.2f} | 市值: {format_market_cap(data['m_cap'])}",
         color=0x2b2d31
     )
 
+    # [排版] 估值结论：引用块 >
     verdict_text = (
-        f"短期: **{model.short_term_verdict}**\n"
-        f"长期: **{model.long_term_verdict}**"
+        f"> **短期:** {model.short_term_verdict}\n"
+        f"> **长期:** {model.long_term_verdict}"
     )
     embed.add_field(name="估值结论", value=verdict_text, inline=False)
 
+    # [排版] 核心数据：行内代码块 ` `
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     peg_display = format_num(data['peg']) if data['peg'] is not None else "N/A"
     
-    # 动态信仰评级
     meme_pct = data['meme_pct']
     meme_desc = "冷门资产"
     if meme_pct >= 80: meme_desc = "狂热宗教"
@@ -401,24 +401,37 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     elif meme_pct >= 30: meme_desc = "机构共识"
     
     core_factors = (
-        f"**Beta:** {format_num(beta_val)} ({beta_desc})\n"
-        f"**PEG:** {peg_display} ({data['growth_desc']})\n"
-        f"**Meme值:** {meme_pct}% ({meme_desc})"
+        f"**Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
+        f"**PEG:** `{peg_display}` ({data['growth_desc']})\n"
+        f"**Meme:** `{meme_pct}%` ({meme_desc})\n"
+        f"**Risk:** 最大回撤 `{data['risk_var']}`"
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
-    if data['risk_var'] != "N/A":
-        embed.add_field(name="95% VaR (月度风险)", value=f"最大回撤可能达 **{data['risk_var']}**", inline=False)
-
+    # [排版] 因子分析：加粗Tag + 双换行符
     log_content = []
     if model.flags: log_content.extend(model.flags) 
-    log_content.extend([f"- {log}" for log in model.logs])
-    log_content.append(f"\n- [策略] {model.strategy}") 
+    log_content.extend([f"{log}" for log in model.logs])
+    
+    strategy_text = f"\n**[策略]** {model.strategy}"
+    
+    formatted_logs = []
+    for log in log_content:
+        # [板块] -> **[板块]**
+        if log.startswith("[") and "]" in log:
+            tag_end = log.find("]") + 1
+            tag = log[:tag_end]
+            content = log[tag_end:]
+            formatted_logs.append(f"**{tag}**{content}")
+        else:
+            formatted_logs.append(log)
 
-    if log_content:
-        log_str = "\n".join(log_content)
-        if len(log_str) > 1000: log_str = log_str[:990] + "..."
-        embed.add_field(name="因子分析", value=f"```\n{log_str}\n```", inline=False)
+    log_str = "\n\n".join(formatted_logs)
+    log_str += f"\n{strategy_text}"
+    
+    if len(log_str) > 1000: log_str = log_str[:990] + "..."
+
+    embed.add_field(name="因子分析", value=log_str, inline=False)
 
     embed.set_footer(text="FMP Ultimate API • 机构级多因子模型 | 模型建议，仅作参考")
 
