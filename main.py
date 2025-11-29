@@ -106,7 +106,7 @@ def get_fmp_data(endpoint, ticker, params=""):
 
 def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
-    url = f"{BASE_URL}/earnings-surprises?symbol={ticker}&apikey={FMP_API_KEY}"
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     return data if data else []
 
