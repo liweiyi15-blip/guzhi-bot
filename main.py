@@ -15,14 +15,14 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
 
-# 使用您测试成功的 stable 节点，兼容性更好
+# *** 核心修正：统一使用 stable 接口，严禁使用 api/v3 ***
 BASE_URL = "https://financialmodelingprep.com/stable"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
 
-# --- 硬科技/高壁垒白名单 (最后一道防线) ---
-HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR"]
+# --- 硬科技/高壁垒白名单 ---
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA"]
 
 # --- 日志配置 ---
 logging.basicConfig(
@@ -37,6 +37,7 @@ logger = logging.getLogger("ValuationBot")
 def get_json_safely(url):
     """安全获取 JSON，处理 Legacy 错误"""
     try:
+        # logger.info(f"📡 Requesting: {url}") # 调试用，确保 URL 正确
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -57,9 +58,8 @@ def get_json_safely(url):
 def get_company_profile_smart(ticker):
     """
     智能获取公司 Profile 数据
-    策略: 优先尝试 /profile (您提供的格式), 失败则通过 /stock-screener 曲线救国
     """
-    # 方案 A: 使用您测试成功的 stable/profile 接口
+    # 方案 A: 使用 stable/profile 接口
     url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
     logger.info(f"📡 Trying Profile Endpoint: {ticker}")
     data = get_json_safely(url_profile)
@@ -67,22 +67,21 @@ def get_company_profile_smart(ticker):
     if data and isinstance(data, list) and len(data) > 0:
         return data[0] # 成功获取
     
-    # 方案 B: Stock Screener 接口 (替代方案，防止 Legacy 报错)
+    # 方案 B: Stock Screener 接口 (替代方案)
     logger.info(f"⚠️ Profile failed. Switching to Stock Screener fallback for {ticker}")
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = get_json_safely(url_screener)
     
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
         item = data_scr[0]
-        # 统一字段格式，模拟 Profile 的返回结构
         return {
             "symbol": item.get("symbol"),
             "price": item.get("price"),
             "beta": item.get("beta"),
-            "mktCap": item.get("marketCap"), # Screener 用 marketCap
+            "mktCap": item.get("marketCap"),
             "companyName": item.get("companyName"),
-            "industry": item.get("industry"), # 关键字段
-            "sector": item.get("sector"),     # 关键字段
+            "industry": item.get("industry"), 
+            "sector": item.get("sector"),     
             "description": "Data fetched via Screener Fallback",
             "image": "N/A"
         }
@@ -91,16 +90,19 @@ def get_company_profile_smart(ticker):
     return None
 
 def get_fmp_data(endpoint, ticker, params=""):
-    """通用数据获取 (非 Profile 类)"""
-    # 注意：FMP 其他接口大多在 api/v3 下，这里需要特殊处理一下 URL
-    base_v3 = "https://financialmodelingprep.com/api/v3"
-    url = f"{base_v3}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
+    """
+    通用数据获取
+    **修正：强制使用 BASE_URL (stable)，不再拼接 /api/v3**
+    """
+    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    """获取历史财报预期与实际数据"""
-    base_v3 = "https://financialmodelingprep.com/api/v3"
-    url = f"{base_v3}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
+    """
+    获取历史财报预期与实际数据
+    **修正：强制使用 BASE_URL (stable)，不再拼接 /api/v3**
+    """
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     data = get_json_safely(url)
     return data if data else []
 
@@ -150,10 +152,10 @@ class ValuationModel:
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
         loop = asyncio.get_event_loop()
         
-        # 并行任务: Profile 单独处理
+        # 并行任务
         task_profile = loop.run_in_executor(None, get_company_profile_smart, self.ticker)
         
-        # 其他数据任务
+        # 这里的 endpoint 参数必须准确对应 FMP 文档，但前面会自动拼上 /stable/
         tasks_generic = {
             "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
@@ -194,7 +196,6 @@ class ValuationModel:
         price = q.get("price") or p.get("price")
         price_200ma = q.get("priceAvg200") 
         
-        # === 核心：读取行业数据 ===
         sector = p.get("sector", "Unknown")
         industry = p.get("industry", "Unknown")
         beta = p.get("beta")
@@ -261,14 +262,12 @@ class ValuationModel:
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
-        # ==========================================
         # --- 硬科技/蓝海赛道 自动判定逻辑 ---
-        # ==========================================
         
         # 1. 白名单 (最高优)
         is_explicit_hard_tech = self.ticker in HARD_TECH_TICKERS
         
-        # 2. 行业关键词自动识别 (根据您提供的数据结构优化)
+        # 2. 行业关键词自动识别
         is_aerospace_sector = False
         sec_str = str(sector).lower() if sector else ""
         ind_str = str(industry).lower() if industry else ""
@@ -285,11 +284,7 @@ class ValuationModel:
         if is_explicit_hard_tech:
             is_hard_tech = True
         elif is_aerospace_sector:
-            # 如果行业匹配，通常直接给通过，或者要求最低限度的增长
             is_hard_tech = True
-
-        # ==========================================
-
 
         # --- VIX & 风险 ---
         vix = vix_data.get("price", 20)
