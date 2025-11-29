@@ -41,20 +41,21 @@ logger = logging.getLogger("ValuationBot")
 def get_json_safely(url):
     """安全获取 JSON"""
     try:
+        # logger.info(f"📡 Requesting: {url}") # 生产环境太吵可注释，调试可解开
         response = requests.get(url, timeout=10)
         data = response.json()
         
         if isinstance(data, dict) and "Error Message" in data:
-            logger.warning(f"API Error for {url}: {data['Error Message']}")
+            logger.warning(f"❌ API Error for {url}: {data['Error Message']}")
             return None
             
         if response.status_code != 200:
-            logger.warning(f"API Status {response.status_code} for {url}")
+            logger.warning(f"❌ API Status {response.status_code} for {url}")
             return None
             
         return data
     except Exception as e:
-        logger.error(f"Request failed for {url}: {e}")
+        logger.error(f"❌ Request Exception for {url}: {e}")
         return None
 
 def get_treasury_rates():
@@ -81,7 +82,7 @@ def get_company_profile_smart(ticker):
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
     
-    logger.info(f"⚠️ Profile failed. Switching to Screener for {ticker}")
+    logger.warning(f"⚠️ Profile endpoint empty/failed. Trying Stock Screener Fallback for {ticker}")
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = get_json_safely(url_screener)
     
@@ -98,17 +99,17 @@ def get_company_profile_smart(ticker):
             "description": "Fetched via Screener",
             "image": "N/A"
         }
+    
+    logger.error(f"❌ Critical: All profile fetch methods failed for {ticker}")
     return None
 
 def get_fmp_data(endpoint, ticker, params=""):
+    """通用数据获取"""
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    """
-    获取历史财报预期与实际数据
-    *** 修正：切回 /earnings 接口，包含 Revenue 和 EPS 的详细数据 ***
-    """
+    """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     data = get_json_safely(url)
     return data if data else []
@@ -155,7 +156,7 @@ class ValuationModel:
         self.fcf_yield_api = None 
 
     async def fetch_data(self):
-        """异步获取所有 FMP 数据"""
+        """异步获取所有 FMP 数据并打印完整调试日志"""
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
         loop = asyncio.get_event_loop()
         
@@ -180,21 +181,33 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # Unpack lists
-        for k in ["quote", "metrics", "ratios", "bs", "vix"]:
-            if isinstance(self.data[k], list) and len(self.data[k]) > 0:
-                self.data[k] = self.data[k][0]
-            elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
-                self.data[k] = {} 
+        # --- 基础数据获取状态日志 ---
+        logger.info(f"--- 🛠️ API Fetch Report for {self.ticker} ---")
+        if profile_data: logger.info(f"✅ Profile: OK")
+        else: logger.error("❌ Profile: FAILED")
 
-        # Log Check
-        logger.info("--- 📊 Data Snapshot ---")
-        if treasury_data:
-            logger.info(f"✅ Macro: 10Y Yield = {treasury_data.get('year10')}%")
-        
-        m = self.data["metrics"]
-        ev_ebitda_final = m.get("evToEBITDA") if m else None
-        logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}")
+        if treasury_data: logger.info(f"✅ Treasury: OK")
+        else: logger.warning("⚠️ Treasury: FAILED")
+
+        for key in tasks_generic.keys():
+            raw_data = self.data[key]
+            if key == "earnings":
+                count = len(raw_data) if isinstance(raw_data, list) else 0
+                logger.info(f"✅ Earnings Records: {count}")
+            elif key == "cf":
+                count = len(raw_data) if isinstance(raw_data, list) else 0
+                if count >= 4: logger.info(f"✅ CashFlow Quarters: {count}")
+                else: logger.warning(f"⚠️ CashFlow Quarters: {count} (Need 4)")
+            else:
+                # 解包前简单检查
+                if isinstance(raw_data, list) and len(raw_data) > 0:
+                    logger.info(f"✅ {key.capitalize()}: OK")
+                    self.data[key] = raw_data[0]
+                else:
+                    logger.warning(f"⚠️ {key.capitalize()}: Empty/None")
+                    self.data[key] = {}
+
+        logger.info("-------------------------------------------")
         
         return self.data["profile"] is not None
 
@@ -211,37 +224,50 @@ class ValuationModel:
         
         if not p: return None
 
-        # === 基础数据提取 ===
+        # ==========================================
+        # === 1. 数据提取 (Data Extraction) ===
+        # ==========================================
+        
+        # --- 基础行情 ---
         price = q.get("price") or p.get("price")
         price_200ma = q.get("priceAvg200") 
-        sector = p.get("sector", "Unknown")
-        industry = p.get("industry", "Unknown")
         beta = p.get("beta")
         if beta is None: beta = 1.0 
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap") or 0
-        
+        vol_today = q.get("volume")
+        vol_avg = q.get("avgVolume")
+
+        # --- 行业属性 ---
+        sector = p.get("sector", "Unknown")
+        industry = p.get("industry", "Unknown")
+
+        # --- 估值乘数 ---
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
+        ps_ratio = r.get("priceToSalesRatioTTM")
+        pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
+        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
+
+        # --- 盈利与现金流 ---
         fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") 
         self.fcf_yield_api = fcf_yield_api 
-        
         roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
         net_margin = r.get("netProfitMarginTTM")
-        ps_ratio = r.get("priceToSalesRatioTTM")
         
-        # PEG/Growth
-        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
-        pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
+        # --- 增长指标 ---
         ni_growth = m.get("netIncomeGrowthTTM")
         rev_growth = r.get("revenueGrowthTTM") 
         
+        # 尝试手动补全 PEG
         if peg is None and pe and ni_growth and ni_growth > 0:
             try: peg = pe / (ni_growth * 100)
             except: pass
-
+        
+        # 隐含增长率
         implied_growth = 0
         if peg and pe and peg > 0:
             implied_growth = (pe / peg) / 100.0
 
+        # 综合最大增长率
         growth_list = [x for x in [rev_growth, ni_growth, implied_growth] if x is not None]
         max_growth = max(growth_list) if growth_list else 0
         
@@ -250,6 +276,51 @@ class ValuationModel:
         elif max_growth > 0.2: growth_desc = "高速"
         elif max_growth > 0.05: growth_desc = "稳健"
         if peg and peg > 3.0: growth_desc = "高预期"
+
+        # --- 宏观数据 ---
+        yield_10y = t.get('year10')
+        vix = vix_data.get("price", 20)
+
+        # ==========================================
+        # *** 📝 全量数据审计日志 (Data Audit Log) ***
+        # ==========================================
+        logger.info(f"--- 📊 Data Audit for {self.ticker} ---")
+        
+        # 基础
+        logger.info(f"🔹 [Basic] Price: {price} | 200MA: {price_200ma} | Beta: {beta} | MCap: {m_cap}")
+        if price is None: logger.warning("⚠️ Missing: Price")
+        if price_200ma is None: logger.warning("⚠️ Missing: Price 200MA")
+        if m_cap == 0: logger.warning("⚠️ Missing: Market Cap")
+
+        # 行业
+        logger.info(f"🔹 [Profile] Sector: {sector} | Industry: {industry}")
+        if sector == "Unknown": logger.warning("⚠️ Missing: Sector")
+
+        # 估值
+        logger.info(f"🔹 [Valuation] EV/EBITDA: {ev_ebitda} | P/S: {ps_ratio} | P/E: {pe} | PEG: {peg}")
+        if ev_ebitda is None: logger.warning("⚠️ Missing: EV/EBITDA")
+        if ps_ratio is None: logger.warning("⚠️ Missing: P/S Ratio")
+        if peg is None: logger.warning("⚠️ Missing: PEG")
+
+        # 盈利/现金流
+        logger.info(f"🔹 [Profitability] FCF Yield: {fcf_yield_api} | ROIC: {roic} | Net Margin: {net_margin}")
+        if fcf_yield_api is None: logger.warning("⚠️ Missing: FCF Yield")
+        if roic is None: logger.warning("⚠️ Missing: ROIC")
+        if net_margin is None: logger.warning("⚠️ Missing: Net Margin")
+
+        # 增长
+        logger.info(f"🔹 [Growth] Rev Growth: {rev_growth} | NI Growth: {ni_growth} | Implied: {implied_growth}")
+        if rev_growth is None: logger.warning("⚠️ Missing: Revenue Growth")
+
+        # 宏观
+        logger.info(f"🔹 [Macro] 10Y Yield: {yield_10y} | VIX: {vix}")
+        if yield_10y is None: logger.warning("⚠️ Missing: Treasury 10Y Yield")
+
+        logger.info("---------------------------------------")
+
+        # ==========================================
+        # === 2. 核心计算 (Core Calculation) ===
+        # ==========================================
         
         # --- Adjusted FCF Yield ---
         adj_fcf_yield = None
@@ -301,10 +372,8 @@ class ValuationModel:
                 is_hard_tech_growth = True
 
         # --- 宏观利率环境 ---
-        yield_10y = t.get('year10')
         macro_discount_factor = 1.0 
         macro_status_log = None
-        
         is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe and pe > 30)
 
         if is_growth_asset and yield_10y is not None:
@@ -319,20 +388,12 @@ class ValuationModel:
             self.logs.append(macro_status_log)
 
         # --- VIX & 风险 ---
-        vix = vix_data.get("price", 20)
-        if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
-        elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
-        else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
-
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
         
         # --- Meme 计分 ---
         meme_score = 0
-        vol_today = q.get("volume")
-        vol_avg = q.get("avgVolume")
-        
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
@@ -500,13 +561,7 @@ class ValuationModel:
             # FCF 逻辑
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
-                
-                is_high_quality_growth = (
-                    ("高速" in growth_desc or "超高速" in growth_desc or 
-                    ("稳健" in growth_desc and roic is not None and roic > 0.20))
-                    and roic is not None and roic > 0.15
-                )
-
+                is_high_quality_growth = (("高速" in growth_desc or "超高速" in growth_desc or ("稳健" in growth_desc and roic is not None and roic > 0.20)) and roic is not None and roic > 0.15)
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 # FCF 修正
@@ -521,7 +576,6 @@ class ValuationModel:
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > (self.fcf_yield_api + 0.0005):
-                        # 判断是否为高 ROIC 优质股
                         if roic and roic > 0.15:
                             self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，**被隐藏的真实造血能力强劲**。")
                         else:
@@ -579,7 +633,6 @@ class ValuationModel:
                 for e in earnings:
                     date = e.get("date")
                     if date and date <= today_str:
-                        # 兼容不同接口字段名
                         rev = e.get("revenueActual") or e.get("revenue") 
                         eps = e.get("epsActual")
                         est = e.get("epsEstimated")
@@ -587,11 +640,10 @@ class ValuationModel:
                         if rev is not None and eps is not None:
                             valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
             
-            # 按日期旧到新排序
             trend_data = sorted(valid_earnings, key=lambda x: x["date"])
             recent_4 = trend_data[-4:] 
             
-            # 日志调试
+            # Debug Log
             logger.info("🔍 [Trend Debug] Analyzing last 4 quarters:")
             for item in recent_4:
                 logger.info(f"   Date: {item['date']} | Rev: {item['rev']} | EPS: {item['eps']}")
