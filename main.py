@@ -7,6 +7,7 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import Optional
 
 # 加载环境变量
 load_dotenv()
@@ -44,6 +45,7 @@ def get_fmp_data(endpoint, ticker, params=""):
             return None
         data = response.json()
         if isinstance(data, list) and endpoint not in ["earnings", "cash-flow-statement"] and "historical" not in endpoint:
+            # 对于返回列表但预期单条记录的接口，取第一条
             return data[0] if len(data) > 0 else None
         return data
     except Exception as e:
@@ -115,6 +117,7 @@ class ValuationModel:
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
+            # FIX: 限制为最近 4 个季度
             "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
             "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
@@ -182,21 +185,26 @@ class ValuationModel:
             ttm_cfo = 0
             ttm_dep_amort = 0
             
-            for q_data in cf_list[:4]: 
+            # 确保按季度进行 TTM 累加，且数据有效
+            quarter_count = 0
+            for q_data in cf_list: 
                 cfo_q = q_data.get("netCashProvidedByOperatingActivities")
                 dep_amort_q = q_data.get("depreciationAndAmortization")
                 
                 if cfo_q is not None and dep_amort_q is not None:
                     ttm_cfo += cfo_q
                     ttm_dep_amort += dep_amort_q
+                    quarter_count += 1
                 else:
                     logger.warning(f"Missing CFO or D&A in quarterly data for TTM calculation. Aborting Adj FCF calculation.")
                     ttm_cfo = 0 
                     break 
 
-            if ttm_cfo != 0:
+            if ttm_cfo != 0 and quarter_count >= 4:
+                # 假设维护性资本支出为折旧与摊销的 50%
                 MAINTENANCE_CAPEX_RATIO = 0.5 
                 maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
+                # Adjusted FCF = CFO - 维护性 CapEx
                 adj_fcf = ttm_cfo - maintenance_capex
                 adj_fcf_yield = adj_fcf / m_cap
                 self.fcf_yield_display = format_percent(adj_fcf_yield) 
@@ -212,6 +220,7 @@ class ValuationModel:
         else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
         if price and beta and vix:
+            # 简化版VaR估算，基于Beta和VIX
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
         
@@ -344,16 +353,19 @@ class ValuationModel:
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 if is_adj_fcf_successful:
+                    # **修改: Adjusted -> Adj**
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
-                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。修正后的 FCF 丰厚，提供良好安全垫。")
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > self.fcf_yield_api:
-                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
+                        # **修改: Adjusted -> Adj**
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
                     elif adj_fcf_yield < self.fcf_yield_api:
-                        self.logs.append(f"[价值修正] Adjusted FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(self.fcf_yield_api)})。")
+                        # **修改: Adjusted -> Adj**
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(self.fcf_yield_api)})。")
                 elif fcf_yield_api is not None:
-                     self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
+                      self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
                 # *** 修正状态记录结束 ***
 
                 # --- 原始 FCF / 其他 FCF 驱动的判断 (仅在未被修正逻辑判定为便宜时运行) ---
@@ -439,7 +451,7 @@ class ValuationModel:
             "m_cap": m_cap,
             "growth_desc": growth_desc,
             "risk_var": self.risk_var,
-            "meme_pct": meme_pct 
+            "meme_pct": meme_pct  
         }
 
 # --- 4. Bot Setup (新增 /privacy 命令 + /analyze 隐私模式) ---
@@ -476,12 +488,12 @@ async def privacy(interaction: discord.Interaction):
     )
 # *** /privacy 命令结束 ***
 
-
-@bot.tree.command(name="analyze", description="估值分析")
-@app_commands.describe(ticker="股票代码 (如 NVDA)")
-async def analyze(interaction: discord.Interaction, ticker: str):
+# --- 核心分析逻辑 (被 /analyze 和 /private_analyze 共享) ---
+async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
     
-    is_privacy_mode = PRIVACY_MODE.get(interaction.user.id, False)
+    # 1. 确定最终的私密/公开状态
+    # 默认状态 (从 /privacy 获取) 或 强制私密 (/private_analyze)
+    is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
     ephemeral_result = is_privacy_mode
     
     # --- Step 1: 立即响应 Discord (Defer) ---
@@ -494,13 +506,17 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     
     # --- Step 3: 条件公共消息 (只有在成功且隐私模式开启时发送) ---
     if is_privacy_mode and success:
+        # **修改: 不使用 Embed，不 @用户，只显示用户名**
         public_message = (
-            f"{interaction.user.mention} 开启 稳-量化估值系统\n"
+            f"**{interaction.user.display_name}** 开启 稳-量化估值系统\n"
             f"`{ticker.upper()}` 正在分析中⚡..."
         )
         # 发送公开状态消息
-        await interaction.channel.send(public_message) 
-        
+        try:
+            await interaction.channel.send(public_message) 
+        except Exception as e:
+            logger.error(f"Failed to send public status message: {e}")
+    
     # --- Step 4: 处理失败 (完成 Deferral) ---
     if not success:
         # 如果获取失败，发送私密（或公开）失败消息
@@ -581,10 +597,29 @@ async def analyze(interaction: discord.Interaction, ticker: str):
     # *** Final Response: 发送最终结果 (完成 Deferral) ***
     await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
 
+# *** /analyze 命令 (默认状态：由 /privacy 决定) ***
+@bot.tree.command(name="analyze", description="估值分析 (结果可见性由/privacy决定)")
+@app_commands.describe(ticker="股票代码 (如 NVDA)")
+async def analyze_command(interaction: discord.Interaction, ticker: str):
+    await process_analysis(interaction, ticker, force_private=False)
+# *** /analyze 命令结束 ***
+
+# *** 新增 /private_analyze 命令 (强制私密) ***
+@bot.tree.command(name="private_analyze", description="私密估值分析 (结果仅自己可见，但会在频道内发布状态)")
+@app_commands.describe(ticker="股票代码 (如 NVDA)")
+async def private_analyze_command(interaction: discord.Interaction, ticker: str):
+    await process_analysis(interaction, ticker, force_private=True)
+# *** /private_analyze 命令结束 ***
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN environment variable not set.")
     else:
         if not FMP_API_KEY:
              logger.error("FMP_API_KEY environment variable not set. FMP data fetching will fail.")
-        bot.run(DISCORD_TOKEN)
+        # 修复：确保 bot.run 在主线程中调用
+        try:
+            bot.run(DISCORD_TOKEN)
+        except Exception as e:
+            logger.error(f"Bot failed to run: {e}")
