@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 数据工具函数 (已修复 requests.get 错误) ---
+# --- 1. 数据工具函数 ---
 
 def get_fmp_data(endpoint, ticker, params=""):
     """从 FMP API 获取数据"""
@@ -38,14 +38,12 @@ def get_fmp_data(endpoint, ticker, params=""):
     safe_url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey=***&{params}"
     try:
         logger.info(f"📡 Requesting: {safe_url}")
-        # FIX: 使用正确的 requests.get
         response = requests.get(url, timeout=10)
         if response.status_code != 200: 
             logger.warning(f"FMP API returned status {response.status_code} for {endpoint}")
             return None
         data = response.json()
         if isinstance(data, list) and endpoint not in ["earnings", "cash-flow-statement"] and "historical" not in endpoint:
-            # 对于返回列表但预期单条记录的接口，取第一条
             return data[0] if len(data) > 0 else None
         return data
     except Exception as e:
@@ -56,7 +54,6 @@ def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     try:
-        # FIX: 使用正确的 requests.get
         response = requests.get(url, timeout=10)
         return response.json() if response.status_code == 200 else []
     except Exception as e: 
@@ -78,7 +75,7 @@ def format_market_cap(num):
     if num >= 1e9: return f"${num/1e9:.2f}B"
     return f"${num/1e6:.2f}M"
 
-# --- 2. 行业基准 (保持不变) ---
+# --- 2. 行业基准 ---
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0, "Consumer Electronics": 25.0, "Communication Services": 20.0,
     "Healthcare": 18.0, "Financial Services": 12.0, "Energy": 10.0,
@@ -91,7 +88,7 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 估值判断模型 (保持不变) ---
+# --- 3. 估值判断模型 ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -117,7 +114,6 @@ class ValuationModel:
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
-            # FIX: 限制为最近 4 个季度
             "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
             "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
@@ -185,7 +181,6 @@ class ValuationModel:
             ttm_cfo = 0
             ttm_dep_amort = 0
             
-            # 确保按季度进行 TTM 累加，且数据有效
             quarter_count = 0
             for q_data in cf_list: 
                 cfo_q = q_data.get("netCashProvidedByOperatingActivities")
@@ -201,10 +196,8 @@ class ValuationModel:
                     break 
 
             if ttm_cfo != 0 and quarter_count >= 4:
-                # 假设维护性资本支出为折旧与摊销的 50%
                 MAINTENANCE_CAPEX_RATIO = 0.5 
                 maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
-                # Adjusted FCF = CFO - 维护性 CapEx
                 adj_fcf = ttm_cfo - maintenance_capex
                 adj_fcf_yield = adj_fcf / m_cap
                 self.fcf_yield_display = format_percent(adj_fcf_yield) 
@@ -220,7 +213,6 @@ class ValuationModel:
         else: self.market_regime = f"恐慌 (VIX {vix:.1f})"
 
         if price and beta and vix:
-            # 简化版VaR估算，基于Beta和VIX
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
         
@@ -228,7 +220,7 @@ class ValuationModel:
         vol_today = q.get("volume")
         vol_avg = q.get("avgVolume")
         
-        # Meme 计分逻辑... (略)
+        # Meme 计分逻辑
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
@@ -316,7 +308,7 @@ class ValuationModel:
                 self.logs.append(f"[成长估值] 缺少有效净利润增长数据，PEG 无法计算。")
             # *** PEG 显式分析结束 ***
 
-            # ... (Meme 信仰模式逻辑 保持不变) ...
+            # ... (Meme 信仰模式逻辑) ...
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
@@ -349,26 +341,23 @@ class ValuationModel:
                     ("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15
                 )
 
-                # *** 记录修正状态 & 核心价值判断 (去重逻辑) ***
+                # *** 记录修正状态 & 核心价值判断 ***
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 if is_adj_fcf_successful:
-                    # **修改: Adjusted -> Adj**
+                    # **使用缩写 Adj**
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > self.fcf_yield_api:
-                        # **修改: Adjusted -> Adj**
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
                     elif adj_fcf_yield < self.fcf_yield_api:
-                        # **修改: Adjusted -> Adj**
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(self.fcf_yield_api)})。")
                 elif fcf_yield_api is not None:
                       self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
-                # *** 修正状态记录结束 ***
 
-                # --- 原始 FCF / 其他 FCF 驱动的判断 (仅在未被修正逻辑判定为便宜时运行) ---
+                # --- 原始 FCF / 其他 FCF 驱动的判断 ---
                 if (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
                     
                     if fcf_yield_used < 0.02 and is_high_quality_growth and not is_faith_mode:
@@ -394,7 +383,7 @@ class ValuationModel:
                 if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
-            # D. Alpha 信号 (保持不变)
+            # D. Alpha 信号
             valid_earnings = []
             today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -506,14 +495,14 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     
     # --- Step 3: 条件公共消息 (只有在成功且隐私模式开启时发送) ---
     if is_privacy_mode and success:
-        # **修改: 不使用 Embed，不 @用户，只显示用户名**
-        public_message = (
-            f"**{interaction.user.display_name}** 开启 稳-量化估值系统\n"
-            f"`{ticker.upper()}` 正在分析中⚡..."
+        # **修改: 使用 Embed 格式**
+        public_embed = discord.Embed(
+            description=f"**{interaction.user.display_name}** 开启 稳-量化估值系统\n⚡正在分析“{ticker.upper()}”中...",
+            color=0x2b2d31  # 使用暗色背景
         )
         # 发送公开状态消息
         try:
-            await interaction.channel.send(public_message) 
+            await interaction.channel.send(embed=public_embed) 
         except Exception as e:
             logger.error(f"Failed to send public status message: {e}")
     
@@ -618,7 +607,6 @@ if __name__ == "__main__":
     else:
         if not FMP_API_KEY:
              logger.error("FMP_API_KEY environment variable not set. FMP data fetching will fail.")
-        # 修复：确保 bot.run 在主线程中调用
         try:
             bot.run(DISCORD_TOKEN)
         except Exception as e:
