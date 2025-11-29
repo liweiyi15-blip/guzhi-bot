@@ -105,8 +105,11 @@ def get_fmp_data(endpoint, ticker, params=""):
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    """获取历史财报预期与实际数据"""
-    url = f"{BASE_URL}/earnings-surprises?symbol={ticker}&apikey={FMP_API_KEY}"
+    """
+    获取历史财报预期与实际数据
+    *** 修正：切回 /earnings 接口，包含 Revenue 和 EPS 的详细数据 ***
+    """
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     data = get_json_safely(url)
     return data if data else []
 
@@ -576,6 +579,7 @@ class ValuationModel:
                 for e in earnings:
                     date = e.get("date")
                     if date and date <= today_str:
+                        # 兼容不同接口字段名
                         rev = e.get("revenueActual") or e.get("revenue") 
                         eps = e.get("epsActual")
                         est = e.get("epsEstimated")
@@ -583,10 +587,11 @@ class ValuationModel:
                         if rev is not None and eps is not None:
                             valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
             
+            # 按日期旧到新排序
             trend_data = sorted(valid_earnings, key=lambda x: x["date"])
             recent_4 = trend_data[-4:] 
             
-            # 🔍 DEBUG LOGS: Print recent 4 quarters to console
+            # 日志调试
             logger.info("🔍 [Trend Debug] Analyzing last 4 quarters:")
             for item in recent_4:
                 logger.info(f"   Date: {item['date']} | Rev: {item['rev']} | EPS: {item['eps']}")
@@ -602,7 +607,6 @@ class ValuationModel:
                     growth_prev = (r_prev - r_prev2) / r_prev2
                     
                     if growth_now > growth_prev * 1.2:
-                        # 修正: 明确标注为环比 QoQ
                         self.logs.append(f"[趋势追踪] **营收加速 (环比)**。最近一季营收环比增速 ({format_percent(growth_now)}) 显著高于前季 ({format_percent(growth_prev)})。")
                     elif growth_now < growth_prev * 0.8:
                         self.logs.append(f"[趋势追踪] 营收环比增速放缓。")
