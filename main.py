@@ -156,23 +156,30 @@ class ValuationModel:
         self.data = dict(zip(tasks_generic.keys(), results_generic))
         self.data["profile"] = profile_data 
         
-        # 简单检查日志
-        m = self.data["metrics"]
-        m_list = m if isinstance(m, list) else [m] if m else []
-        m_data = m_list[0] if m_list else {}
-        logger.info(f"✅ [Data Check] {self.ticker} FCF Yield: {m_data.get('freeCashFlowYieldTTM')}")
-
-        # List unwrapping
+        # Unpack lists
         for k in ["quote", "metrics", "ratios", "bs", "vix"]:
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
             elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
                 self.data[k] = {} 
+
+        # --- 增强型日志检查 (显示实际获取到的关键值) ---
+        m = self.data["metrics"]
+        r = self.data["ratios"]
+        
+        # 模拟 analyze 中的查找逻辑，以便日志和分析结果一致
+        ev_ebitda_final = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
+        
+        logger.info("--- 📊 Data Snapshot ---")
+        if self.data["profile"]:
+            logger.info(f"✅ Profile: {self.data['profile'].get('industry')}")
+        logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}, FCF_Yield_Raw={m.get('freeCashFlowYieldTTM')}")
+        logger.info("------------------------")
         
         return self.data["profile"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑 (v4.1 亏损成长股优化版)"""
+        """核心估值分析逻辑"""
         p = self.data.get("profile", {}) or {}
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
@@ -192,7 +199,10 @@ class ValuationModel:
         if beta is None: beta = 1.0 
         
         m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap") or p.get("marketCap") or 0
+        
+        # 这里的查找顺序决定了最终值
         ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
+        
         fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") 
         self.fcf_yield_api = fcf_yield_api 
         
@@ -251,7 +261,7 @@ class ValuationModel:
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
-        # --- 硬科技判定 ---
+        # --- 硬科技/蓝海赛道 自动判定 ---
         is_explicit_hard_tech = self.ticker in HARD_TECH_TICKERS
         is_aerospace_sector = False
         sec_str = str(sector).lower() if sector else ""
@@ -310,51 +320,38 @@ class ValuationModel:
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         is_distressed = False
-        is_loss_making_growth = False # 新增：亏损成长股标记
+        is_loss_making_growth = False
         
-        # 1. 困境判定 (加入亏损成长股的豁免逻辑)
         if not is_hard_tech:
-            # 如果净利率为负
             if (net_margin is not None and net_margin < -0.05):
-                # 检查：是否为“高增长”可以豁免？(营收增长 > 10%)
                 if rev_growth is not None and rev_growth > 0.10:
                     is_loss_making_growth = True
-                    # 豁免困境标记
                 else:
                     is_distressed = True
                     st_status = "极其昂贵/困境"
                     self.logs.append(f"[预警] 净利率为负且缺乏增长支撑，EV/EBITDA 指标失效。")
-            
-            # 如果 FCF 极差，也可能触发
             elif (fcf_yield_api is not None and fcf_yield_api < -0.05):
-                 # 同样检查增长豁免
                  if rev_growth is not None and rev_growth > 0.10:
                      is_loss_making_growth = True
                  else:
                      is_distressed = True
                      st_status = "极其昂贵/失血"
                      self.logs.append(f"[预警] 自由现金流严重流失且无增长支撑。")
-
         else:
-             self.logs.append(f"[蓝海赛道] 识别为**硬科技**资产 ({industry})。豁免常规盈利指标，切换至 P/S 估值模型。")
+             self.logs.append(f"[蓝海赛道] 识别为**硬科技/蓝海赛道**资产 ({industry})。豁免常规盈利指标，切换至 P/S 估值模型。")
 
         if not is_distressed:
-            # === 硬科技 OR 亏损成长股 (统一用 P/S 估值) ===
             if is_hard_tech or is_loss_making_growth:
-                
-                # 日志前缀
                 tag = "[蓝海赛道]" if is_hard_tech else "[亏损成长]"
-                
                 if ps_ratio is not None:
                     ps_desc = ""
-                    # 针对亏损成长股的 P/S 评级标准
                     if ps_ratio < 1.5: 
                         st_status = "低估 (P/S)"
-                        ps_desc = "处于历史低位，相对于营收规模被低估，可能存在**极度悲观预期**"
+                        ps_desc = "处于历史低位，相对于营收规模被低估"
                         self.strategy = "当前价格包含极高安全边际，关注困境反转逻辑。"
                     elif ps_ratio < 3.0:
                         st_status = "合理 (P/S)"
-                        ps_desc = "处于合理区间，估值与当前的营收增长相匹配"
+                        ps_desc = "处于合理区间"
                     elif ps_ratio < 8.0:
                         st_status = "溢价 (P/S)"
                         ps_desc = "较高，市场给予了较高的增长溢价"
@@ -362,15 +359,11 @@ class ValuationModel:
                         st_status = "过热 (P/S)"
                         ps_desc = "极高，价格已透支未来多年的增长"
                     
-                    if is_loss_making_growth:
-                        self.logs.append(f"{tag} 虽净利润亏损，但营收增长 ({format_percent(rev_growth)}) 强劲。切换至 P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
-                    else:
-                        self.logs.append(f"{tag} 属于硬科技领域。当前 P/S ({format_num(ps_ratio)}) {ps_desc}。")
+                    self.logs.append(f"{tag} 切换至 P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
                 else:
                     st_status = "无法评估 (无营收)"
                     self.logs.append(f"{tag} 缺少营收数据，无法进行 P/S 估值。")
             
-            # === 普通盈利企业 (EV/EBITDA) ===
             elif ev_ebitda is not None:
                 ratio = ev_ebitda / sector_avg
                 if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
@@ -397,7 +390,6 @@ class ValuationModel:
         is_value_trap = False
 
         if net_margin is not None and net_margin < 0 and price_200ma and price < price_200ma:
-            # 豁免：硬科技 OR 亏损成长且增长不错
             if not is_hard_tech and not is_loss_making_growth:
                 is_value_trap = True
                 lt_status = "风险极大"
@@ -406,7 +398,6 @@ class ValuationModel:
                 self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
-            # PEG
             if peg is not None and peg > 0:
                 if peg < 0.8:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于低位，暗示市场低估了公司的未来成长潜力。")
@@ -415,10 +406,8 @@ class ValuationModel:
                 elif 0.8 <= peg <= 2.5:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
             elif peg is not None and peg <= 0 and ni_growth is not None and ni_growth < 0:
-                # 对于亏损股，PEG 无意义，不报错
                 pass
 
-            # Meme 信仰
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
@@ -441,37 +430,39 @@ class ValuationModel:
                 if "昂贵" in lt_status: lt_status = "高溢价 (资金动量)"
                 if self.strategy == "数据不足": self.strategy = meme_strategy
 
-            # FCF 逻辑
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
+                
+                # 定义高质量成长变量
                 is_high_quality_growth = (
                     ("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15
                 )
+
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
-                # [资本开支] 逻辑：硬科技 OR 亏损成长
+                # FCF 修正逻辑
                 if is_adj_fcf_successful and (is_hard_tech or is_loss_making_growth):
                     if adj_fcf_yield > self.fcf_yield_api:
-                        self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于原始值 ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
+                        # 修正: 显示具体的 API 原始值
+                        self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                         if adj_fcf_yield > 0.04: lt_status = "便宜"
                 
                 elif is_adj_fcf_successful and not is_hard_tech and not is_loss_making_growth:
-                    # 普通股修正
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
-                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值，修正后的 FCF 丰厚，提供良好安全垫。")
+                        # 修正: 显示具体的 API 原始值
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > self.fcf_yield_api:
-                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值，反映出增长性资本支出的积极影响。")
+                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
 
                 if is_hard_tech:
                     lt_status = "蓝海/战略卡位"
                     if not is_adj_fcf_successful:
                         self.logs.append(f"[护城河] 处于竞争不充分的蓝海市场，行业壁垒极高，稀缺性溢价合理。")
                     if self.strategy == "数据不足" or "风险" in self.strategy:
-                        self.strategy = "估值锚点在于远期市场垄断地位。短期受资金情绪影响大，适合在技术回调时分批布局。"
+                        self.strategy = "估值锚点在于远期市场垄断地位。短期受资金情绪影响大，适合在技术回调时分批布局，非信徒需谨慎。"
                 
-                # 亏损成长股策略
                 elif is_loss_making_growth:
                     lt_status = "观察/成长"
                     if self.strategy == "数据不足" or "风险" in self.strategy:
@@ -486,9 +477,14 @@ class ValuationModel:
                         lt_status = "昂贵"
                         self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                         if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
+                    
                     elif roic and roic > 0.20 and not is_faith_mode:
                         lt_status = "优质/值得等待"
                         self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
+                        
+                        # *** 修复: 优质资产的默认策略 ***
+                        if self.strategy == "数据不足":
+                            self.strategy = "基本面极其优秀，护城河深厚。当前价格虽未显著低估，但适合长期持有或逢低吸纳。"
 
             if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
                 self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
@@ -537,7 +533,6 @@ class ValuationModel:
                 if len(recent) >= 3:
                     beats_check = sum(1 for x in recent if x["act"] > x["est"])
                     if beats_check / len(recent) >= 0.75:
-                        # 亏损反转策略合并
                         if not is_loss_making_growth and not is_hard_tech:
                             self.strategy = "基本面虽处于亏损，但业绩连续超预期，可关注‘困境反转’的可能性。"
                             lt_status = "观察/反转"
