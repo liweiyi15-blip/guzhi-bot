@@ -60,7 +60,8 @@ def get_json_safely(url):
 def get_treasury_rates():
     """获取最新的国债收益率"""
     today = datetime.now()
-    start_date = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+    # 向前取7天以防假期
+    start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
     
     url = f"{BASE_URL}/treasury-rates?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
@@ -105,7 +106,11 @@ def get_fmp_data(endpoint, ticker, params=""):
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
+    """
+    获取历史财报数据 (含营收和EPS)
+    注意：FMP /earnings 接口返回的数据包含未来预测，需在逻辑层过滤
+    """
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=50" # 取多一点以便过滤
     data = get_json_safely(url)
     return data if data else []
 
@@ -192,6 +197,10 @@ class ValuationModel:
         ev_ebitda_final = m.get("evToEBITDA") if m else None
         logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}")
         
+        # 检查财报数据条数
+        earnings_count = len(self.data["earnings"]) if isinstance(self.data["earnings"], list) else 0
+        logger.info(f"✅ Earnings Raw Count: {earnings_count}")
+        
         return self.data["profile"] is not None
 
     def analyze(self):
@@ -275,7 +284,7 @@ class ValuationModel:
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
-        # --- 赛道识别 ---
+        # --- 赛道识别逻辑 ---
         is_blue_ocean = False      
         is_hard_tech_growth = False 
         
@@ -550,48 +559,58 @@ class ValuationModel:
             if fcf_yield_used is None and not use_ps_valuation:
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
-            # --- [趋势追踪] Trend Analysis ---
+            # --- [趋势追踪] Trend Analysis (New Feature) ---
+            # 1. 过滤清洗数据
             valid_earnings = []
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            
             if isinstance(earnings, list):
                 for e in earnings:
                     date = e.get("date")
-                    rev = e.get("revenue") # FMP earnings endpoint has 'revenue'
-                    eps = e.get("epsActual")
-                    est = e.get("epsEstimated")
-                    if date and rev is not None and eps is not None:
-                        valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
+                    # Earnings 接口字段通常是 revenueActual, epsActual
+                    # 必须过滤掉未来的日期
+                    if date and date <= today_str:
+                        rev = e.get("revenueActual") or e.get("revenue") # 兼容不同字段名
+                        eps = e.get("epsActual")
+                        est = e.get("epsEstimated")
+                        
+                        if rev is not None and eps is not None:
+                            valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
             
-            # Sort old -> new for trend analysis
+            # 按日期排序（旧 -> 新）
             trend_data = sorted(valid_earnings, key=lambda x: x["date"])
-            recent_4 = trend_data[-4:] # Last 4 quarters
+            recent_4 = trend_data[-4:] 
 
             if len(recent_4) >= 3:
-                # 1. Revenue Trend (YoY logic is better but QoQ is what we have in sequence)
-                # Check for acceleration in absolute revenue
-                revs = [x["rev"] for x in recent_4]
-                if revs[-1] > revs[-2] > revs[-3]:
-                    # Simple check: is the gap widening?
-                    diff1 = revs[-2] - revs[-3]
-                    diff2 = revs[-1] - revs[-2]
-                    if diff2 > diff1 * 1.1:
-                        self.logs.append(f"[趋势追踪] 营收加速增长。近期营收呈现逐季加速态势，成长逻辑强化。")
-                    else:
-                        self.logs.append(f"[趋势追踪] 营收稳步增长。")
-                elif revs[-1] < revs[-2]:
-                    self.logs.append(f"[趋势追踪] 营收环比下滑。需警惕增长瓶颈或季节性因素。")
+                # 2. 营收趋势 (QoQ 简单判断加速)
+                # 逻辑：比较最近两次的环比增长是否在变大
+                # R3, R2, R1 (Now)
+                r_now = recent_4[-1]["rev"]
+                r_prev = recent_4[-2]["rev"]
+                r_prev2 = recent_4[-3]["rev"]
+                
+                # 避免分母为0
+                if r_prev > 0 and r_prev2 > 0:
+                    growth_now = (r_now - r_prev) / r_prev
+                    growth_prev = (r_prev - r_prev2) / r_prev2
+                    
+                    if growth_now > growth_prev * 1.2:
+                        self.logs.append(f"[趋势追踪] **营收加速**。最近一季营收增速 ({format_percent(growth_now)}) 显著高于前季 ({format_percent(growth_prev)})。")
+                    elif growth_now < growth_prev * 0.8:
+                        self.logs.append(f"[趋势追踪] 营收增速放缓。")
 
-                # 2. Earnings Turnaround
+                # 3. 困境反转 / 亏损收窄
                 epss = [x["eps"] for x in recent_4]
+                # 情况A: 扭亏 (前三季亏，这一季正)
                 if all(e < 0 for e in epss[:-1]) and epss[-1] > 0:
                     self.logs.append(f"[趋势追踪] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
+                # 情况B: 亏损收窄 (都是负的，但越来越接近0)
                 elif all(e < 0 for e in epss):
-                    # Check if narrowing: Q4 > Q3 > Q2 (mathematically -0.1 > -0.5)
-                    if epss[-1] > epss[-2] > epss[-3]:
-                        self.logs.append(f"[趋势追踪] 亏损逐季收窄。经营效率提升，距离盈利平衡点渐近。")
+                    if epss[-1] > epss[-2]:
+                        self.logs.append(f"[趋势追踪] 亏损环比收窄。经营效率提升，距离盈利平衡点渐近。")
 
-            # [Alpha] logic (kept from before, looks at beats)
-            if len(trend_data) > 0:
-                # Use the last 4 sorted chronologically, iterate to check beats
+            # [Alpha] 业绩超预期逻辑
+            if len(recent_4) > 0:
                 beats = sum(1 for x in recent_4 if x["est"] is not None and x["eps"] > x["est"])
                 total = len(recent_4)
                 if total > 0:
@@ -614,10 +633,8 @@ class ValuationModel:
                 self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备类似债券的特征。")
 
             if net_margin and net_margin < 0:
-                # Check recent logic again for strategy override
                 if len(recent_4) >= 3:
-                     # Re-evaluate turnaround for strategy
-                     pass
+                    pass
 
         self.long_term_verdict = lt_status
 
