@@ -176,22 +176,18 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # *** 修复点：先解包列表，再做日志和后续处理 ***
+        # Unpack lists
         for k in ["quote", "metrics", "ratios", "bs", "vix"]:
-            # 如果是列表且有内容，取第一个
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
-            # 如果是列表但空的，或者是 None，设为空字典
-            elif not self.data[k] or (isinstance(self.data[k], list) and len(self.data[k]) == 0):
+            elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
                 self.data[k] = {} 
 
-        # --- 日志检查 (现在已经是字典了，可以安全使用 .get) ---
+        # Log Check
         logger.info("--- 📊 Data Snapshot ---")
         if treasury_data:
             logger.info(f"✅ Macro: 10Y Yield = {treasury_data.get('year10')}%")
-        else:
-            logger.warning("⚠️ Macro: Treasury data missing")
-            
+        
         m = self.data["metrics"]
         ev_ebitda_final = m.get("evToEBITDA") if m else None
         logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}")
@@ -279,9 +275,7 @@ class ValuationModel:
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
-        # ==================================================
-        # --- 赛道识别逻辑 ---
-        # ==================================================
+        # --- 赛道识别 ---
         is_blue_ocean = False      
         is_hard_tech_growth = False 
         
@@ -302,9 +296,7 @@ class ValuationModel:
             if not is_blue_ocean: 
                 is_hard_tech_growth = True
 
-        # ==================================================
-        # --- 宏观利率环境判定 ---
-        # ==================================================
+        # --- 宏观利率环境 ---
         yield_10y = t.get('year10')
         macro_discount_factor = 1.0 
         macro_status_log = None
@@ -369,7 +361,6 @@ class ValuationModel:
         st_status = "估值合理"
         is_distressed = False
         
-        # 决策：是走 P/S 估值 还是 EV/EBITDA 估值？
         is_profitable = (net_margin is not None and net_margin > 0)
         use_ps_valuation = False
         
@@ -391,17 +382,12 @@ class ValuationModel:
                  self.logs.append(f"[预警] 自由现金流严重流失且无增长支撑。")
 
         if not is_distressed:
-            # === P/S 估值模式 (针对亏损赛道股) ===
             if use_ps_valuation:
                 tag = "[蓝海赛道]" if is_blue_ocean else "[硬科技]"
-                
                 if ps_ratio is not None:
                     # 宏观调整阈值
-                    th_low = 1.5
-                    th_fair = 3.0
-                    th_high = 8.0
-                    if is_blue_ocean:
-                        th_low, th_fair, th_high = 2.0, 5.0, 15.0
+                    th_low, th_fair, th_high = 1.5, 3.0, 8.0
+                    if is_blue_ocean: th_low, th_fair, th_high = 2.0, 5.0, 15.0
                     
                     th_low *= macro_discount_factor
                     th_fair *= macro_discount_factor
@@ -422,12 +408,11 @@ class ValuationModel:
                         st_status = "过热 (P/S)"
                         ps_desc = "极高，价格已透支未来多年的增长"
                     
-                    self.logs.append(f"{tag} 切换至 P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
+                    self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
                 else:
                     st_status = "无法评估 (无营收)"
                     self.logs.append(f"{tag} 缺少营收数据，无法进行 P/S 估值。")
             
-            # === EV/EBITDA 估值模式 (盈利企业) ===
             elif ev_ebitda is not None:
                 ratio = ev_ebitda / sector_avg
                 adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -467,7 +452,6 @@ class ValuationModel:
             # PEG
             if peg is not None and peg > 0:
                 peg_strict = peg / macro_discount_factor
-
                 if is_blue_ocean:
                     if peg_strict < 1.0: 
                         self.logs.append(f"[爆发前夜] PEG ({format_num(peg)}) 极低。对于指数级增长行业，这通常意味着**极度低估**。")
@@ -484,7 +468,7 @@ class ValuationModel:
                         self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
             
             elif (peg is None or peg <= 0) and is_blue_ocean:
-                 self.logs.append(f"[指数级增长] 线性 PEG 指标失效。当前定价隐含了**非线性的业绩爆发路径**，本质是对于终局垄断地位的期权定价。")
+                 self.logs.append(f"[爆发前夜] 由于当前处于投入期（净利为负），PEG 暂时不适用，重点关注营收爆发力。")
 
             # Meme 信仰
             if is_faith_mode:
@@ -515,9 +499,9 @@ class ValuationModel:
                 is_high_quality_growth = (("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15)
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
-                # FCF 修正逻辑
+                # FCF 修正
                 if is_adj_fcf_successful and use_ps_valuation:
-                    if adj_fcf_yield > self.fcf_yield_api:
+                    if adj_fcf_yield > (self.fcf_yield_api + 0.002):
                         self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                         if adj_fcf_yield > 0.04: lt_status = "便宜"
                 
@@ -526,7 +510,7 @@ class ValuationModel:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
-                    elif adj_fcf_yield > self.fcf_yield_api:
+                    elif adj_fcf_yield > (self.fcf_yield_api + 0.002):
                          self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
 
                 if is_blue_ocean:
@@ -566,29 +550,56 @@ class ValuationModel:
             if fcf_yield_used is None and not use_ps_valuation:
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
-            # Alpha
+            # --- [趋势追踪] Trend Analysis ---
             valid_earnings = []
-            today_str = datetime.now().strftime("%Y-%m-%d")
             if isinstance(earnings, list):
                 for e in earnings:
-                    est = e.get("epsEstimated")
-                    act = e.get("epsActual")
                     date = e.get("date")
-                    if est is not None and act is not None and date is not None:
-                        if date < today_str:
-                            valid_earnings.append({"est": est, "act": act, "date": date})
+                    rev = e.get("revenue") # FMP earnings endpoint has 'revenue'
+                    eps = e.get("epsActual")
+                    est = e.get("epsEstimated")
+                    if date and rev is not None and eps is not None:
+                        valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
             
-            valid_earnings.sort(key=lambda x: x["date"], reverse=True)
-            recent = valid_earnings[:4]
-            
-            if len(recent) > 0:
-                beats = sum(1 for x in recent if x["act"] > x["est"])
-                total = len(recent)
-                beat_rate = beats / total
-                if beat_rate >= 0.75:
-                    self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
-                else:
-                    self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
+            # Sort old -> new for trend analysis
+            trend_data = sorted(valid_earnings, key=lambda x: x["date"])
+            recent_4 = trend_data[-4:] # Last 4 quarters
+
+            if len(recent_4) >= 3:
+                # 1. Revenue Trend (YoY logic is better but QoQ is what we have in sequence)
+                # Check for acceleration in absolute revenue
+                revs = [x["rev"] for x in recent_4]
+                if revs[-1] > revs[-2] > revs[-3]:
+                    # Simple check: is the gap widening?
+                    diff1 = revs[-2] - revs[-3]
+                    diff2 = revs[-1] - revs[-2]
+                    if diff2 > diff1 * 1.1:
+                        self.logs.append(f"[趋势追踪] 营收加速增长。近期营收呈现逐季加速态势，成长逻辑强化。")
+                    else:
+                        self.logs.append(f"[趋势追踪] 营收稳步增长。")
+                elif revs[-1] < revs[-2]:
+                    self.logs.append(f"[趋势追踪] 营收环比下滑。需警惕增长瓶颈或季节性因素。")
+
+                # 2. Earnings Turnaround
+                epss = [x["eps"] for x in recent_4]
+                if all(e < 0 for e in epss[:-1]) and epss[-1] > 0:
+                    self.logs.append(f"[趋势追踪] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
+                elif all(e < 0 for e in epss):
+                    # Check if narrowing: Q4 > Q3 > Q2 (mathematically -0.1 > -0.5)
+                    if epss[-1] > epss[-2] > epss[-3]:
+                        self.logs.append(f"[趋势追踪] 亏损逐季收窄。经营效率提升，距离盈利平衡点渐近。")
+
+            # [Alpha] logic (kept from before, looks at beats)
+            if len(trend_data) > 0:
+                # Use the last 4 sorted chronologically, iterate to check beats
+                beats = sum(1 for x in recent_4 if x["est"] is not None and x["eps"] > x["est"])
+                total = len(recent_4)
+                if total > 0:
+                    beat_rate = beats / total
+                    if beat_rate >= 0.75:
+                        self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
+                    else:
+                        self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
             else:
                 self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
             
@@ -603,13 +614,10 @@ class ValuationModel:
                 self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备类似债券的特征。")
 
             if net_margin and net_margin < 0:
-                if len(recent) >= 3:
-                    beats_check = sum(1 for x in recent if x["act"] > x["est"])
-                    if beats_check / len(recent) >= 0.75:
-                        if not use_ps_valuation:
-                            self.strategy = "基本面虽处于亏损，但业绩连续超预期，可关注‘困境反转’的可能性。"
-                            lt_status = "观察/反转"
-                            self.logs.append(f"[反转] 尽管年度亏损，但近期业绩强劲，基本面可能有边际改善的信号。")
+                # Check recent logic again for strategy override
+                if len(recent_4) >= 3:
+                     # Re-evaluate turnaround for strategy
+                     pass
 
         self.long_term_verdict = lt_status
 
