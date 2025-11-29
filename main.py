@@ -67,9 +67,10 @@ def get_treasury_rates():
     
     data = get_json_safely(url)
     if data and isinstance(data, list) and len(data) > 0:
+        logger.info(f"✅ [API] Treasury Data fetched: {len(data)} records.")
         return data[0]
     
-    logger.warning("⚠️ Treasury rates data is empty.")
+    logger.warning("⚠️ [API] Treasury rates data is empty or failed.")
     return None
 
 def get_company_profile_smart(ticker):
@@ -79,6 +80,7 @@ def get_company_profile_smart(ticker):
     data = get_json_safely(url_profile)
     
     if data and isinstance(data, list) and len(data) > 0:
+        logger.info(f"✅ [API] Profile Data fetched for {ticker}.")
         return data[0]
     
     logger.info(f"⚠️ Profile failed. Switching to Screener for {ticker}")
@@ -87,6 +89,7 @@ def get_company_profile_smart(ticker):
     
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
         item = data_scr[0]
+        logger.info(f"✅ [API] Profile fetched via Screener for {ticker}.")
         return {
             "symbol": item.get("symbol"),
             "price": item.get("price"),
@@ -94,20 +97,31 @@ def get_company_profile_smart(ticker):
             "mktCap": item.get("marketCap"),
             "companyName": item.get("companyName"),
             "industry": item.get("industry"), 
-            "sector": item.get("sector"),     
+            "sector": item.get("sector"),      
             "description": "Fetched via Screener",
             "image": "N/A"
         }
+    logger.warning(f"⚠️ [API] Profile Data COMPLETELY MISSING for {ticker}.")
     return None
 
 def get_fmp_data(endpoint, ticker, params=""):
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
-    return get_json_safely(url)
+    data = get_json_safely(url)
+    if data:
+        count = len(data) if isinstance(data, list) else (1 if data else 0)
+        logger.info(f"✅ [API] {endpoint} fetched: {count} items.")
+    else:
+        logger.warning(f"⚠️ [API] {endpoint} returned None/Empty.")
+    return data
 
 def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
+    if data:
+        logger.info(f"✅ [API] Earnings fetched: {len(data)} quarters.")
+    else:
+        logger.warning(f"⚠️ [API] Earnings returned None.")
     return data if data else []
 
 def format_percent(num):
@@ -151,6 +165,20 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
 
+    def extract(self, source, key, desc, default=None):
+        """严格的数据提取与日志记录辅助函数"""
+        val = source.get(key)
+        if val is None:
+            if default is not None:
+                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None. Using Default: {default}")
+                return default
+            else:
+                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
+                return None
+        else:
+            logger.info(f"✅ [Data] {desc}: {val}")
+            return val
+
     async def fetch_data(self):
         """异步获取所有 FMP 数据"""
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
@@ -177,72 +205,107 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # Unpack lists
+        # Unpack lists safely
         for k in ["quote", "metrics", "ratios", "bs", "vix"]:
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
             elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
+                logger.warning(f"⚠️ [Structure] {k} list is empty.")
                 self.data[k] = {} 
+            elif self.data[k] is None:
+                logger.warning(f"⚠️ [Structure] {k} is None.")
+                self.data[k] = {}
 
-        # Log Check
-        logger.info("--- 📊 Data Snapshot ---")
-        if treasury_data:
-            logger.info(f"✅ Macro: 10Y Yield = {treasury_data.get('year10')}%")
-        
-        m = self.data["metrics"]
-        r = self.data["ratios"]
-        ev_ebitda_final = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
-        
-        logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}")
-        
         return self.data["profile"] is not None
 
     def analyze(self):
         """核心估值分析逻辑"""
+        logger.info("--- 🚀 Starting Calculation Logic ---")
+        
         p = self.data.get("profile", {}) or {}
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
         t = self.data.get("treasury", {}) or {} 
         vix_data = self.data.get("vix", {}) or {}
-        earnings = self.data.get("earnings", []) or {}
+        earnings = self.data.get("earnings", []) or []
         cf_list = self.data.get("cf", []) or [] 
         
-        if not p: return None
+        if not p: 
+            logger.error("🛑 Critical: Profile data missing, aborting analysis.")
+            return None
 
         # === 基础数据提取 ===
-        price = q.get("price") or p.get("price")
-        price_200ma = q.get("priceAvg200") 
-        sector = p.get("sector", "Unknown")
-        industry = p.get("industry", "Unknown")
-        beta = p.get("beta")
-        if beta is None: beta = 1.0 
-        m_cap = q.get("marketCap") or m.get("marketCap") or p.get("mktCap") or 0
+        price_p = self.extract(p, "price", "Profile Price")
+        price_q = self.extract(q, "price", "Quote Price")
+        price = price_q if price_q else price_p
         
-        ev_ebitda = m.get("evToEBITDA") or m.get("enterpriseValueOverEBITDATTM") or r.get("enterpriseValueMultipleTTM")
-        fcf_yield_api = m.get("freeCashFlowYield") or m.get("freeCashFlowYieldTTM") 
+        price_200ma = self.extract(q, "priceAvg200", "200 Day MA")
+        
+        sector = self.extract(p, "sector", "Sector", "Unknown")
+        industry = self.extract(p, "industry", "Industry", "Unknown")
+        
+        beta = self.extract(p, "beta", "Beta")
+        if beta is None: 
+            logger.info("ℹ️ Beta is None, using default 1.0")
+            beta = 1.0 
+        
+        # Market Cap Hierarchy
+        mc_q = self.extract(q, "marketCap", "Quote MarketCap")
+        mc_m = self.extract(m, "marketCap", "Metrics MarketCap")
+        mc_p = self.extract(p, "mktCap", "Profile MarketCap")
+        m_cap = mc_q or mc_m or mc_p or 0
+        logger.info(f"✅ [Data] Final Market Cap Used: {m_cap}")
+        
+        # EV/EBITDA Hierarchy
+        ev_1 = self.extract(m, "evToEBITDA", "Metrics evToEBITDA")
+        ev_2 = self.extract(m, "enterpriseValueOverEBITDATTM", "Metrics EV/EBITDA TTM")
+        ev_3 = self.extract(r, "enterpriseValueMultipleTTM", "Ratios EV Multiple TTM")
+        ev_ebitda = ev_1 or ev_2 or ev_3
+        logger.info(f"✅ [Data] Final EV/EBITDA Used: {ev_ebitda}")
+        
+        # FCF Yield
+        fcf_1 = self.extract(m, "freeCashFlowYield", "Metrics FCF Yield")
+        fcf_2 = self.extract(m, "freeCashFlowYieldTTM", "Metrics FCF Yield TTM")
+        fcf_yield_api = fcf_1 or fcf_2
         self.fcf_yield_api = fcf_yield_api 
+        logger.info(f"✅ [Data] Final FCF Yield API: {fcf_yield_api}")
         
-        roic = m.get("returnOnInvestedCapital") or m.get("returnOnInvestedCapitalTTM")
-        net_margin = r.get("netProfitMarginTTM")
-        ps_ratio = r.get("priceToSalesRatioTTM")
+        # Other Metrics
+        roic_1 = self.extract(m, "returnOnInvestedCapital", "Metrics ROIC")
+        roic_2 = self.extract(m, "returnOnInvestedCapitalTTM", "Metrics ROIC TTM")
+        roic = roic_1 if roic_1 is not None else roic_2
+        logger.info(f"✅ [Data] Final ROIC: {roic}")
+
+        net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM")
+        ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM")
         
         # PEG/Growth
-        peg = r.get("priceToEarningsGrowthRatioTTM") or r.get("pegRatioTTM")
-        pe = r.get("priceEarningsRatioTTM") or m.get("peRatioTTM")
-        ni_growth = m.get("netIncomeGrowthTTM")
-        rev_growth = r.get("revenueGrowthTTM") 
+        peg_1 = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG Ratio (Ratios)")
+        peg_2 = self.extract(r, "pegRatioTTM", "PEG Ratio (Ratios/Alt)")
+        peg = peg_1 if peg_1 is not None else peg_2
+        
+        pe_1 = self.extract(r, "priceEarningsRatioTTM", "PE Ratio (Ratios)")
+        pe_2 = self.extract(m, "peRatioTTM", "PE Ratio (Metrics)")
+        pe = pe_1 if pe_1 is not None else pe_2
+        
+        ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
+        rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
         
         if peg is None and pe and ni_growth and ni_growth > 0:
-            try: peg = pe / (ni_growth * 100)
+            try: 
+                peg = pe / (ni_growth * 100)
+                logger.info(f"ℹ️ Calculated PEG manually: {peg}")
             except: pass
 
         implied_growth = 0
         if peg and pe and peg > 0:
             implied_growth = (pe / peg) / 100.0
+            logger.info(f"ℹ️ Calculated Implied Growth: {implied_growth}")
 
         growth_list = [x for x in [rev_growth, ni_growth, implied_growth] if x is not None]
         max_growth = max(growth_list) if growth_list else 0
+        logger.info(f"✅ [Data] Max Growth Detected: {max_growth}")
         
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
@@ -253,17 +316,20 @@ class ValuationModel:
         # --- Adjusted FCF Yield ---
         adj_fcf_yield = None
         if len(cf_list) >= 4 and m_cap and m_cap > 0:
+            logger.info(f"🔄 Processing Cash Flow List ({len(cf_list)} items)...")
             ttm_cfo = 0
             ttm_dep_amort = 0
             quarter_count = 0
-            for q_data in cf_list: 
-                cfo_q = q_data.get("netCashProvidedByOperatingActivities")
-                dep_amort_q = q_data.get("depreciationAndAmortization")
+            for i, q_data in enumerate(cf_list): 
+                cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", f"CF Q{i} CFO")
+                dep_amort_q = self.extract(q_data, "depreciationAndAmortization", f"CF Q{i} D&A")
+                
                 if cfo_q is not None and dep_amort_q is not None:
                     ttm_cfo += cfo_q
                     ttm_dep_amort += dep_amort_q
                     quarter_count += 1
                 else:
+                    logger.warning(f"⚠️ CF Data Broken at Q{i}, stopping accumulation.")
                     ttm_cfo = 0 
                     break 
 
@@ -273,13 +339,18 @@ class ValuationModel:
                 adj_fcf = ttm_cfo - maintenance_capex
                 adj_fcf_yield = adj_fcf / m_cap
                 self.fcf_yield_display = format_percent(adj_fcf_yield) 
+                logger.info(f"✅ [Calculated] Adj FCF Yield: {adj_fcf_yield}")
+            else:
+                logger.warning("⚠️ Failed to calculate Adj FCF (Insufficient data).")
+        else:
+            logger.warning("⚠️ Not enough Cash Flow quarters to calculate TTM.")
             
         fcf_yield_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
         # --- 赛道识别逻辑 ---
-        is_blue_ocean = False      
+        is_blue_ocean = False       
         is_hard_tech_growth = False 
         
         sec_str = str(sector).lower() if sector else ""
@@ -288,19 +359,22 @@ class ValuationModel:
         for kw in BLUE_OCEAN_KEYWORDS:
             if kw in sec_str or kw in ind_str:
                 is_blue_ocean = True
+                logger.info(f"✅ Identified Blue Ocean Keyword: {kw}")
                 break
         
         for kw in HARD_TECH_KEYWORDS:
             if kw in sec_str or kw in ind_str:
                 is_hard_tech_growth = True
+                logger.info(f"✅ Identified Hard Tech Keyword: {kw}")
                 break
         
         if self.ticker in HARD_TECH_TICKERS:
+            logger.info(f"✅ Ticker {self.ticker} in Hard Tech Whitelist.")
             if not is_blue_ocean: 
                 is_hard_tech_growth = True
 
         # --- 宏观利率环境 ---
-        yield_10y = t.get('year10')
+        yield_10y = self.extract(t, 'year10', "10Y Treasury Yield")
         macro_discount_factor = 1.0 
         macro_status_log = None
         
@@ -318,15 +392,17 @@ class ValuationModel:
             self.logs.append(macro_status_log)
 
         # --- VIX & 风险 ---
-        vix = vix_data.get("price", 20)
+        vix = self.extract(vix_data, "price", "VIX Price", 20)
+        
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
+            logger.info(f"✅ [Calculated] Monthly Risk VaR: {self.risk_var}")
         
         # --- Meme 计分 ---
         meme_score = 0
-        vol_today = q.get("volume")
-        vol_avg = q.get("avgVolume")
+        vol_today = self.extract(q, "volume", "Volume Today")
+        vol_avg = self.extract(q, "avgVolume", "Avg Volume")
         
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
@@ -354,6 +430,7 @@ class ValuationModel:
         meme_score = max(0, min(10, meme_score))
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 50
+        logger.info(f"✅ [Calculated] Meme Score: {meme_score}, Pct: {meme_pct}%")
 
         # --- 短期估值判断 ---
         sector_avg = get_sector_benchmark(sector)
@@ -438,7 +515,7 @@ class ValuationModel:
         lt_status = "中性"
         is_value_trap = False
 
-        if net_margin is not None and net_margin < 0 and price_200ma and price < price_200ma:
+        if net_margin is not None and net_margin < 0 and price_200ma and price and price < price_200ma:
             if not use_ps_valuation: 
                 is_value_trap = True
                 lt_status = "风险极大"
@@ -505,20 +582,20 @@ class ValuationModel:
                 
                 # FCF 修正
                 if is_adj_fcf_successful and use_ps_valuation:
-                    if adj_fcf_yield > (self.fcf_yield_api + 0.0005): 
-                        self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
+                    if fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005): 
+                        self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                         if adj_fcf_yield > 0.04: lt_status = "便宜"
                 
                 elif is_adj_fcf_successful and not use_ps_valuation:
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
-                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
-                    elif adj_fcf_yield > (self.fcf_yield_api + 0.0005):
+                    elif fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005):
                         if roic and roic > 0.15:
-                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，**被隐藏的真实造血能力强劲**。")
+                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，**被隐藏的真实造血能力强劲**。")
                         else:
-                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
+                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})，反映出增长性资本支出的积极影响。")
 
                 if is_blue_ocean:
                     lt_status = "蓝海/战略卡位"
@@ -575,12 +652,13 @@ class ValuationModel:
             today_str = datetime.now().strftime("%Y-%m-%d")
             
             if isinstance(earnings, list):
+                logger.info(f"🔄 Processing Earnings List ({len(earnings)} items)...")
                 for e in earnings:
                     date = e.get("date")
                     if date and date <= today_str:
-                        rev = e.get("revenueActual") or e.get("revenue") 
-                        eps = e.get("epsActual")
-                        est = e.get("epsEstimated")
+                        rev = self.extract(e, "revenueActual", f"Earn {date} Rev", default=e.get("revenue"))
+                        eps = self.extract(e, "epsActual", f"Earn {date} EPS")
+                        est = self.extract(e, "epsEstimated", f"Earn {date} Est")
                         
                         if rev is not None and eps is not None:
                             valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
@@ -588,11 +666,6 @@ class ValuationModel:
             trend_data = sorted(valid_earnings, key=lambda x: x["date"])
             recent_4 = trend_data[-4:] 
             
-            # Debug Log
-            logger.info("🔍 [Trend Debug] Analyzing last 4 quarters:")
-            for item in recent_4:
-                logger.info(f"   Date: {item['date']} | Rev: {item['rev']} | EPS: {item['eps']}")
-
             if len(recent_4) >= 3:
                 # Revenue
                 r_now = recent_4[-1]["rev"]
@@ -638,10 +711,6 @@ class ValuationModel:
                 self.strategy = "低波动防御性资产，可视为市场震荡环境下的潜在避险配置。"
                 lt_status = "防御/收息"
                 self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备类似债券的特征。")
-
-            if net_margin and net_margin < 0:
-                if len(recent_4) >= 3:
-                    pass
 
         self.long_term_verdict = lt_status
 
