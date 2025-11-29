@@ -22,7 +22,7 @@ V3_URL = "https://financialmodelingprep.com/api/v3"
 # 存储用户隐私偏好: {user_id: True/False}
 PRIVACY_MODE = {}
 
-# --- 日志配置 (保持不变) ---
+# --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -82,6 +82,9 @@ SECTOR_EBITDA_MEDIAN = {
     "Utilities": 12.0, "Unknown": 18.0
 }
 
+# 硬科技/高壁垒名单 (也可以通过 Sector 判断)
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA"]
+
 def get_sector_benchmark(sector):
     if not sector: return 18.0
     for key in SECTOR_EBITDA_MEDIAN:
@@ -123,7 +126,7 @@ class ValuationModel:
         return self.data["profile"] is not None and self.data["quote"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑 (TTM Adjusted FCF)"""
+        """核心估值分析逻辑"""
         p = self.data.get("profile", {}) or {}
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
@@ -137,6 +140,7 @@ class ValuationModel:
         price = q.get("price")
         price_200ma = q.get("priceAvg200")
         sector = p.get("sector", "Unknown")
+        industry = p.get("industry", "Unknown")
         beta = p.get("beta")
         if beta is None: beta = 1.0 
         
@@ -191,7 +195,6 @@ class ValuationModel:
                     ttm_dep_amort += dep_amort_q
                     quarter_count += 1
                 else:
-                    logger.warning(f"Missing CFO or D&A in quarterly data for TTM calculation. Aborting Adj FCF calculation.")
                     ttm_cfo = 0 
                     break 
 
@@ -206,7 +209,17 @@ class ValuationModel:
         if fcf_yield_used == fcf_yield_api:
             self.fcf_yield_display = format_percent(fcf_yield_api) 
         
-        # ... (VIX/风险/Meme Score/短期估值逻辑 保持不变) ...
+        # --- 硬科技/蓝海赛道 判定逻辑 ---
+        # 判定条件：
+        # 1. 行业是 Aerospace & Defense 或特定名单
+        # 2. 营收增长 > 15% (证明不是夕阳产业，而是成长期)
+        is_aerospace = "Aerospace" in sector or "Defense" in sector or "Space" in industry
+        is_known_tech = self.ticker in HARD_TECH_TICKERS
+        
+        # 核心判定：是否为“硬科技成长期”
+        is_hard_tech_growth = (is_aerospace or is_known_tech) and (rev_growth is not None and rev_growth > 0.15)
+
+        # --- VIX & 风险 ---
         vix = vix_data.get("price", 20)
         if vix < 20: self.market_regime = f"平静 (VIX {vix:.1f})"
         elif vix < 30: self.market_regime = f"震荡 (VIX {vix:.1f})"
@@ -216,11 +229,11 @@ class ValuationModel:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
             self.risk_var = f"-{monthly_risk_pct:.1f}%"
         
+        # --- Meme 计分 ---
         meme_score = 0
         vol_today = q.get("volume")
         vol_avg = q.get("avgVolume")
         
-        # Meme 计分逻辑
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
             elif price > price_200ma * 1.15: meme_score += 1
@@ -248,17 +261,37 @@ class ValuationModel:
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 50
 
+        # --- 短期估值判断 ---
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         
         is_distressed = False
-        if (net_margin is not None and net_margin < -0.05) or (fcf_yield_api is not None and fcf_yield_api < -0.02):
-            is_distressed = True
-            st_status = "极其昂贵"
-            self.logs.append(f"[预警] 净利率或原始 FCF 为负，EV/EBITDA 指标已失效。")
         
+        # [修改点]：如果是硬科技成长期，豁免“亏损即困境”的判断
+        if not is_hard_tech_growth:
+            if (net_margin is not None and net_margin < -0.05) or (fcf_yield_api is not None and fcf_yield_api < -0.02):
+                is_distressed = True
+                st_status = "极其昂贵"
+                self.logs.append(f"[预警] 净利率或原始 FCF 为负，EV/EBITDA 指标已失效。")
+        else:
+             self.logs.append(f"[赛道] 识别为**硬科技/蓝海赛道**资产，当前处于高投入换增长阶段，豁免常规盈利指标检查。")
+
         if not is_distressed:
-            if ev_ebitda is not None:
+            if is_hard_tech_growth:
+                # [修改点]：硬科技赛道改用 P/S (市销率) 估值
+                if ps_ratio is not None:
+                    if ps_ratio < 10:
+                        st_status = "低估 (P/S)"
+                        self.logs.append(f"[蓝海估值] P/S ({format_num(ps_ratio)}) 处于早期成长股的低位区间，相对于其垄断潜力被低估。")
+                    elif ps_ratio < 20:
+                        st_status = "合理溢价 (P/S)"
+                        self.logs.append(f"[蓝海估值] P/S ({format_num(ps_ratio)}) 较高，但包含了对**行业壁垒和未来垄断地位**的预期溢价。")
+                    else:
+                        st_status = "过热 (P/S)"
+                        self.logs.append(f"[蓝海估值] P/S ({format_num(ps_ratio)}) 极高，即使考虑赛道稀缺性，价格也已透支未来多年的增长。")
+            
+            # 常规 EV/EBITDA 逻辑
+            elif ev_ebitda is not None:
                 ratio = ev_ebitda / sector_avg
                 if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
                     st_status = "便宜 (高成长)"
@@ -276,8 +309,6 @@ class ValuationModel:
                 else:
                     st_status = "估值合理"
                     self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
-            else:
-                self.logs.append(f"[板块] 缺少 EV/EBITDA 数据，无法对比。")
         
         self.short_term_verdict = st_status
 
@@ -286,11 +317,12 @@ class ValuationModel:
         is_value_trap = False
 
         if net_margin is not None and net_margin < 0 and price_200ma and price < price_200ma:
-            is_value_trap = True
-            lt_status = "风险极大"
-            st_status = "下跌趋势"
-            self.logs.append(f"[风险] 公司长期亏损且股价位于年线下方，看似低估实为“价值陷阱”。")
-            self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
+            if not is_hard_tech_growth: # 硬科技豁免价值陷阱判定（因为它们往往在年线附近震荡且亏损）
+                is_value_trap = True
+                lt_status = "风险极大"
+                st_status = "下跌趋势"
+                self.logs.append(f"[风险] 公司长期亏损且股价位于年线下方，看似低估实为“价值陷阱”。")
+                self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
             
@@ -304,9 +336,6 @@ class ValuationModel:
                     self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
             elif peg is not None and peg <= 0 and ni_growth is not None and ni_growth < 0:
                 self.logs.append(f"[成长估值] 净利润增长 ({format_percent(ni_growth)}) 为负，PEG 不适用，需关注盈利能力恢复情况。")
-            elif peg is None:
-                self.logs.append(f"[成长估值] 缺少有效净利润增长数据，PEG 无法计算。")
-            # *** PEG 显式分析结束 ***
 
             # ... (Meme 信仰模式逻辑) ...
             if is_faith_mode:
@@ -345,25 +374,29 @@ class ValuationModel:
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 if is_adj_fcf_successful:
-                    # **使用缩写 Adj**
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
-                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。修正后的 FCF 丰厚，提供良好安全垫。")
+                        self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif adj_fcf_yield > self.fcf_yield_api:
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值 ({format_percent(self.fcf_yield_api)})，反映出**增长性资本支出**的积极影响。")
                     elif adj_fcf_yield < self.fcf_yield_api:
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 低于 API 原始值 ({format_percent(self.fcf_yield_api)})。")
-                elif fcf_yield_api is not None:
-                      self.logs.append(f"[提示] FCF Yield 字段显示原始值 ({fcf_str})，因季度数据不足，**CapEx 修正未能生效。**")
+                
+                # [修改点] 硬科技逻辑对长期估值的影响
+                if is_hard_tech_growth:
+                    lt_status = "蓝海/战略卡位"
+                    self.logs.append(f"[硬科技] 尽管 FCF 暂为负，但这是行业特有的**资本开支前置**特征。")
+                    self.logs.append(f"[护城河] 处于竞争不充分的蓝海市场，行业壁垒极高，稀缺性溢价合理。")
+                    if self.strategy == "数据不足": self.strategy = "核心逻辑在于技术壁垒与市场垄断潜力，适合对赛道有信仰的长线资本。"
 
                 # --- 原始 FCF / 其他 FCF 驱动的判断 ---
-                if (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
+                # 只有在不是硬科技成长股的情况下，才严格执行 FCF 惩罚
+                if not is_hard_tech_growth and (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
                     
                     if fcf_yield_used < 0.02 and is_high_quality_growth and not is_faith_mode:
                         lt_status = "预期驱动/投资扩张"
                         self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
-                        if self.strategy == "数据不足": self.strategy = "估值已反映高增长预期，价格波动可能随业绩剧烈放大，需要警惕。"
                     
                     elif fcf_yield_used < 0.02 and not is_high_quality_growth and not is_faith_mode:
                         lt_status = "昂贵"
@@ -372,15 +405,13 @@ class ValuationModel:
                     
                     elif roic and roic > 0.20 and not is_faith_mode:
                         lt_status = "优质/值得等待"
-                        if self.strategy == "数据不足": self.strategy = "此类高效率资产适合长期配置者择机分批建仓。"
                         self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
 
             if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
                 self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
                 if lt_status == "中性": lt_status = "优质"
             
-            if fcf_yield_used is None:
-                if not is_faith_mode: self.strategy = "当前数据不足以形成明确的估值倾向。"
+            if fcf_yield_used is None and not is_hard_tech_growth:
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
             # D. Alpha 信号
@@ -443,7 +474,7 @@ class ValuationModel:
             "meme_pct": meme_pct  
         }
 
-# --- 4. Bot Setup (新增 /privacy 命令 + /analyze 隐私模式) ---
+# --- 4. Bot Setup ---
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -481,34 +512,29 @@ async def privacy(interaction: discord.Interaction):
 async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
     
     # 1. 确定最终的私密/公开状态
-    # 默认状态 (从 /privacy 获取) 或 强制私密 (/private_analyze)
     is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
     ephemeral_result = is_privacy_mode
     
     # --- Step 1: 立即响应 Discord (Defer) ---
-    # Defer privately if privacy mode is ON, otherwise defer publicly.
     await interaction.response.defer(thinking=True, ephemeral=ephemeral_result) 
 
     # --- Step 2: 数据获取 (耗时操作) ---
     model = ValuationModel(ticker)
     success = await model.fetch_data()
     
-    # --- Step 3: 条件公共消息 (只有在成功且隐私模式开启时发送) ---
+    # --- Step 3: 条件公共消息 ---
     if is_privacy_mode and success:
-        # **修改: 使用 Embed 格式**
         public_embed = discord.Embed(
-            description=f"**{interaction.user.display_name}** 开启 稳-量化估值系统\n⚡正在分析“{ticker.upper()}”中...",
-            color=0x2b2d31  # 使用暗色背景
+            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n⚡正在分析“{ticker.upper()}”中...",
+            color=0x2b2d31
         )
-        # 发送公开状态消息
         try:
             await interaction.channel.send(embed=public_embed) 
         except Exception as e:
             logger.error(f"Failed to send public status message: {e}")
     
-    # --- Step 4: 处理失败 (完成 Deferral) ---
+    # --- Step 4: 处理失败 ---
     if not success:
-        # 如果获取失败，发送私密（或公开）失败消息
         await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
         return
 
@@ -525,14 +551,14 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         color=0x2b2d31
     )
 
-    # [排版] 估值结论：引用块 >
+    # [排版] 估值结论
     verdict_text = (
         f"> **短期:** {model.short_term_verdict}\n"
         f"> **长期:** {model.long_term_verdict}"
     )
     embed.add_field(name="估值结论", value=verdict_text, inline=False)
 
-    # [排版] 核心数据：只保留 Beta 和 Meme 值
+    # [排版] 核心数据
     beta_val = data['beta']
     beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
     
@@ -583,22 +609,20 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
     
 
-    # *** Final Response: 发送最终结果 (完成 Deferral) ***
+    # *** Final Response ***
     await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
 
-# *** /analyze 命令 (默认状态：由 /privacy 决定) ***
+# *** /analyze 命令 ***
 @bot.tree.command(name="analyze", description="估值分析 (结果可见性由/privacy决定)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def analyze_command(interaction: discord.Interaction, ticker: str):
     await process_analysis(interaction, ticker, force_private=False)
-# *** /analyze 命令结束 ***
 
-# *** 新增 /private_analyze 命令 (强制私密) ***
+# *** /private_analyze 命令 ***
 @bot.tree.command(name="private_analyze", description="私密估值分析 (结果仅自己可见，但会在频道内发布状态)")
 @app_commands.describe(ticker="股票代码 (如 NVDA)")
 async def private_analyze_command(interaction: discord.Interaction, ticker: str):
     await process_analysis(interaction, ticker, force_private=True)
-# *** /private_analyze 命令结束 ***
 
 
 if __name__ == "__main__":
