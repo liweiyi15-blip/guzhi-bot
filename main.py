@@ -22,7 +22,7 @@ BASE_URL = "https://financialmodelingprep.com/stable"
 PRIVACY_MODE = {}
 
 # --- 白名单 ---
-HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA"]
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD"]
 
 # --- 关键词词典 ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
@@ -60,7 +60,6 @@ def get_json_safely(url):
 def get_treasury_rates():
     """获取最新的国债收益率"""
     today = datetime.now()
-    # 向前取7天以防假期
     start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
     
@@ -106,11 +105,8 @@ def get_fmp_data(endpoint, ticker, params=""):
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    """
-    获取历史财报数据 (含营收和EPS)
-    注意：FMP /earnings 接口返回的数据包含未来预测，需在逻辑层过滤
-    """
-    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=50" # 取多一点以便过滤
+    """获取历史财报预期与实际数据"""
+    url = f"{BASE_URL}/earnings-surprises?symbol={ticker}&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     return data if data else []
 
@@ -196,10 +192,6 @@ class ValuationModel:
         m = self.data["metrics"]
         ev_ebitda_final = m.get("evToEBITDA") if m else None
         logger.info(f"✅ Key Metrics: EV/EBITDA_Final={ev_ebitda_final}")
-        
-        # 检查财报数据条数
-        earnings_count = len(self.data["earnings"]) if isinstance(self.data["earnings"], list) else 0
-        logger.info(f"✅ Earnings Raw Count: {earnings_count}")
         
         return self.data["profile"] is not None
 
@@ -505,12 +497,18 @@ class ValuationModel:
             # FCF 逻辑
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
-                is_high_quality_growth = (("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15)
+                
+                is_high_quality_growth = (
+                    ("高速" in growth_desc or "超高速" in growth_desc or 
+                    ("稳健" in growth_desc and roic is not None and roic > 0.20))
+                    and roic is not None and roic > 0.15
+                )
+
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
                 # FCF 修正
                 if is_adj_fcf_successful and use_ps_valuation:
-                    if adj_fcf_yield > (self.fcf_yield_api + 0.002):
+                    if adj_fcf_yield > (self.fcf_yield_api + 0.0005): 
                         self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                         if adj_fcf_yield > 0.04: lt_status = "便宜"
                 
@@ -519,8 +517,12 @@ class ValuationModel:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，修正后的 FCF 丰厚，提供良好安全垫。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
-                    elif adj_fcf_yield > (self.fcf_yield_api + 0.002):
-                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
+                    elif adj_fcf_yield > (self.fcf_yield_api + 0.0005):
+                        # 判断是否为高 ROIC 优质股
+                        if roic and roic > 0.15:
+                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，**被隐藏的真实造血能力强劲**。")
+                        else:
+                            self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(self.fcf_yield_api)})，反映出增长性资本支出的积极影响。")
 
                 if is_blue_ocean:
                     lt_status = "蓝海/战略卡位"
@@ -536,22 +538,29 @@ class ValuationModel:
 
                 # 普通股 FCF 判断
                 if not use_ps_valuation and (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
-                    if fcf_yield_used < 0.02 and is_high_quality_growth and not is_faith_mode:
+                    
+                    fcf_threshold = 0.01 if (roic and roic > 0.20) else 0.02
+                    
+                    if fcf_yield_used < fcf_threshold and is_high_quality_growth and not is_faith_mode:
                         lt_status = "预期驱动/投资扩张"
                         self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
-                    elif fcf_yield_used < 0.02 and not is_high_quality_growth and not is_faith_mode:
+                    
+                    elif fcf_yield_used < fcf_threshold and not is_high_quality_growth and not is_faith_mode:
                         lt_status = "昂贵"
                         self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                         if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
                     
                     elif roic and roic > 0.20 and not is_faith_mode:
                         lt_status = "优质/值得等待"
-                        self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
-                        if self.strategy == "数据不足":
-                            self.strategy = "基本面极其优秀，护城河深厚。当前价格虽未显著低估，但适合长期持有或逢低吸纳。"
+                        has_value_fix_log = any("[价值修正]" in x for x in self.logs)
+                        if not has_value_fix_log:
+                            self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
+                        
+                        if self.strategy == "数据不足" or "风险" in self.strategy:
+                            self.strategy = "属于典型的**优质溢价**资产。高 ROIC 消化了高估值，不应苛求当下的 FCF 收益率。适合长期持有。"
 
             if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
-                has_dialectic = any("[辩证]" in x for x in self.logs)
+                has_dialectic = any("[辩证]" in x or "[价值修正]" in x for x in self.logs)
                 if not has_dialectic:
                     self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 优秀，资本效率高。")
                 if lt_status == "中性": lt_status = "优质"
@@ -559,57 +568,54 @@ class ValuationModel:
             if fcf_yield_used is None and not use_ps_valuation:
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
-            # --- [趋势追踪] Trend Analysis (New Feature) ---
-            # 1. 过滤清洗数据
+            # --- [趋势追踪] Trend Analysis ---
             valid_earnings = []
             today_str = datetime.now().strftime("%Y-%m-%d")
             
             if isinstance(earnings, list):
                 for e in earnings:
                     date = e.get("date")
-                    # Earnings 接口字段通常是 revenueActual, epsActual
-                    # 必须过滤掉未来的日期
                     if date and date <= today_str:
-                        rev = e.get("revenueActual") or e.get("revenue") # 兼容不同字段名
+                        rev = e.get("revenueActual") or e.get("revenue") 
                         eps = e.get("epsActual")
                         est = e.get("epsEstimated")
                         
                         if rev is not None and eps is not None:
                             valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
             
-            # 按日期排序（旧 -> 新）
             trend_data = sorted(valid_earnings, key=lambda x: x["date"])
             recent_4 = trend_data[-4:] 
+            
+            # 🔍 DEBUG LOGS: Print recent 4 quarters to console
+            logger.info("🔍 [Trend Debug] Analyzing last 4 quarters:")
+            for item in recent_4:
+                logger.info(f"   Date: {item['date']} | Rev: {item['rev']} | EPS: {item['eps']}")
 
             if len(recent_4) >= 3:
-                # 2. 营收趋势 (QoQ 简单判断加速)
-                # 逻辑：比较最近两次的环比增长是否在变大
-                # R3, R2, R1 (Now)
+                # Revenue
                 r_now = recent_4[-1]["rev"]
                 r_prev = recent_4[-2]["rev"]
                 r_prev2 = recent_4[-3]["rev"]
                 
-                # 避免分母为0
                 if r_prev > 0 and r_prev2 > 0:
                     growth_now = (r_now - r_prev) / r_prev
                     growth_prev = (r_prev - r_prev2) / r_prev2
                     
                     if growth_now > growth_prev * 1.2:
-                        self.logs.append(f"[趋势追踪] **营收加速**。最近一季营收增速 ({format_percent(growth_now)}) 显著高于前季 ({format_percent(growth_prev)})。")
+                        # 修正: 明确标注为环比 QoQ
+                        self.logs.append(f"[趋势追踪] **营收加速 (环比)**。最近一季营收环比增速 ({format_percent(growth_now)}) 显著高于前季 ({format_percent(growth_prev)})。")
                     elif growth_now < growth_prev * 0.8:
-                        self.logs.append(f"[趋势追踪] 营收增速放缓。")
+                        self.logs.append(f"[趋势追踪] 营收环比增速放缓。")
 
-                # 3. 困境反转 / 亏损收窄
+                # Earnings
                 epss = [x["eps"] for x in recent_4]
-                # 情况A: 扭亏 (前三季亏，这一季正)
                 if all(e < 0 for e in epss[:-1]) and epss[-1] > 0:
                     self.logs.append(f"[趋势追踪] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
-                # 情况B: 亏损收窄 (都是负的，但越来越接近0)
                 elif all(e < 0 for e in epss):
                     if epss[-1] > epss[-2]:
                         self.logs.append(f"[趋势追踪] 亏损环比收窄。经营效率提升，距离盈利平衡点渐近。")
 
-            # [Alpha] 业绩超预期逻辑
+            # [Alpha]
             if len(recent_4) > 0:
                 beats = sum(1 for x in recent_4 if x["est"] is not None and x["eps"] > x["est"])
                 total = len(recent_4)
