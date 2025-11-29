@@ -40,7 +40,6 @@ def get_json_safely(url):
         response = requests.get(url, timeout=10)
         data = response.json()
         
-        # 检查是否是 API 错误消息
         if isinstance(data, dict) and "Error Message" in data:
             logger.warning(f"API Error for {url}: {data['Error Message']}")
             return None
@@ -55,16 +54,14 @@ def get_json_safely(url):
         return None
 
 def get_company_profile_smart(ticker):
-    """
-    智能获取公司 Profile 数据 (Profile -> Screener)
-    """
+    """智能获取公司 Profile 数据"""
     # 方案 A: Profile
     url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
     logger.info(f"📡 Trying Profile Endpoint: {ticker}")
     data = get_json_safely(url_profile)
     
     if data and isinstance(data, list) and len(data) > 0:
-        return data[0] # 成功获取
+        return data[0]
     
     # 方案 B: Stock Screener
     logger.info(f"⚠️ Profile failed/empty. Switching to Stock Screener fallback for {ticker}")
@@ -89,12 +86,10 @@ def get_company_profile_smart(ticker):
     return None
 
 def get_fmp_data(endpoint, ticker, params=""):
-    """通用数据获取"""
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
     return get_json_safely(url)
 
 def get_earnings_data(ticker):
-    """获取历史财报"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}&limit=40"
     data = get_json_safely(url)
     return data if data else []
@@ -166,14 +161,12 @@ class ValuationModel:
         # --- 详细的数据完整性检查日志 ---
         logger.info("--- 📊 Data Integrity Check ---")
         
-        # 1. Profile
         if not self.data["profile"]:
             logger.warning("⚠️ [Data Check] PROFILE is Missing!")
         else:
             p = self.data["profile"]
             logger.info(f"✅ [Data Check] Profile: Sector={p.get('sector')}, Industry={p.get('industry')}")
 
-        # 2. Quote
         q = self.data["quote"]
         if isinstance(q, list) and len(q) > 0: self.data["quote"] = q[0]
         elif not q: self.data["quote"] = {}
@@ -184,7 +177,6 @@ class ValuationModel:
         else:
              logger.warning("⚠️ [Data Check] QUOTE is Missing!")
 
-        # 3. Metrics (关键!)
         m = self.data["metrics"]
         if isinstance(m, list) and len(m) > 0: self.data["metrics"] = m[0]
         elif not m: self.data["metrics"] = {}
@@ -193,9 +185,8 @@ class ValuationModel:
         if m_clean:
              logger.info(f"✅ [Data Check] Metrics: EV/EBITDA={m_clean.get('evToEBITDA')}, FCF Yield={m_clean.get('freeCashFlowYieldTTM')}")
         else:
-             logger.warning("⚠️ [Data Check] METRICS (TTM) is Missing! (Possible cause: IPO too recent or API data gap)")
+             logger.warning("⚠️ [Data Check] METRICS (TTM) is Missing!")
 
-        # 4. Ratios (关键!)
         r = self.data["ratios"]
         if isinstance(r, list) and len(r) > 0: self.data["ratios"] = r[0]
         elif not r: self.data["ratios"] = {}
@@ -206,7 +197,6 @@ class ValuationModel:
         else:
              logger.warning("⚠️ [Data Check] RATIOS (TTM) is Missing!")
 
-        # 5. List items
         if isinstance(self.data["bs"], list) and len(self.data["bs"]) > 0: self.data["bs"] = self.data["bs"][0]
         if isinstance(self.data["vix"], list) and len(self.data["vix"]) > 0: self.data["vix"] = self.data["vix"][0]
         
@@ -355,7 +345,6 @@ class ValuationModel:
         st_status = "估值合理"
         is_distressed = False
         
-        # 困境判定：硬科技豁免
         if not is_hard_tech:
             if (net_margin is not None and net_margin < -0.05) or (fcf_yield_api is not None and fcf_yield_api < -0.02):
                 is_distressed = True
@@ -364,7 +353,6 @@ class ValuationModel:
         
         if not is_distressed:
             if is_hard_tech:
-                # *** 优化：合并 [赛道] 和 [蓝海估值] ***
                 if ps_ratio is not None:
                     ps_desc = ""
                     if ps_ratio < 10: 
@@ -383,7 +371,6 @@ class ValuationModel:
                     self.logs.append(f"[蓝海赛道] 属于 **{industry}** 硬科技领域，但缺少营收数据，无法进行 P/S 估值。")
             
             elif ev_ebitda is not None:
-                # 普通股逻辑
                 ratio = ev_ebitda / sector_avg
                 if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
                     st_status = "便宜 (高成长)"
@@ -454,17 +441,20 @@ class ValuationModel:
             # FCF 逻辑
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
+                
+                # *** 修复点：确保变量已定义 ***
+                is_high_quality_growth = (
+                    ("高速" in growth_desc or "超高速" in growth_desc) and roic is not None and roic > 0.15
+                )
+
                 is_adj_fcf_successful = adj_fcf_yield is not None
                 
-                # *** 优化：合并 [价值修正] 和 [硬科技] -> [资本开支] ***
                 if is_adj_fcf_successful and is_hard_tech:
                     if adj_fcf_yield > self.fcf_yield_api:
-                        # 修正为正 或 修正后仍然负但比API好
                         self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于原始值 ({format_percent(self.fcf_yield_api)})，反映出显著的**前置性资本投入**特征，符合硬科技扩张期的财务逻辑。")
                         if adj_fcf_yield > 0.04: lt_status = "便宜"
                 
                 elif is_adj_fcf_successful and not is_hard_tech:
-                    # 普通股的修正逻辑
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值，修正后的 FCF 丰厚，提供良好安全垫。")
@@ -472,14 +462,11 @@ class ValuationModel:
                     elif adj_fcf_yield > self.fcf_yield_api:
                          self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 API 原始值，反映出增长性资本支出的积极影响。")
 
-                
                 if is_hard_tech:
                     lt_status = "蓝海/战略卡位"
-                    # [硬科技] 日志已合并到上方 [资本开支] 中，不再单独显示，除非没有修正成功
                     if not is_adj_fcf_successful:
                         self.logs.append(f"[护城河] 处于竞争不充分的蓝海市场，行业壁垒极高，稀缺性溢价合理。")
                     
-                    # *** 优化：硬科技专属策略 ***
                     if self.strategy == "数据不足" or "风险" in self.strategy:
                         self.strategy = "估值锚点在于远期市场垄断地位。短期受资金情绪影响大，适合在技术回调时分批布局，非信徒需谨慎。"
 
