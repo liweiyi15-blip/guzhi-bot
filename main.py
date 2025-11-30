@@ -235,7 +235,7 @@ class ValuationModel:
         return self.data["profile"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑"""
+        """核心估值分析逻辑 (无 Try Wrapper)"""
         logger.info("--- 🚀 Starting Calculation Logic ---")
         
         p = self.data.get("profile", {}) or {}
@@ -432,8 +432,8 @@ class ValuationModel:
         st_status = "估值合理"
         is_distressed = False
         
-        # 修复：初始化 use_ps_valuation 防止报错
-        use_ps_valuation = False
+        # 初始化 use_ps_valuation 防止报错
+        use_ps_valuation = False 
         
         if is_profitable_strict:
             use_ps_valuation = False
@@ -567,6 +567,7 @@ class ValuationModel:
                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
             elif peg_used is None:
                 if not is_profitable_strict and (eps_fy1_val is None or eps_fy1_val <= 0):
+                     # 修改：亏损企业 PEG 文案 - 简洁事实
                      self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。公司尚未盈利。")
                 else:
                      self.logs.append(f"[成长锚点] PEG 数据缺失。")
@@ -577,6 +578,7 @@ class ValuationModel:
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
+                    # 回滚：Meme 策略
                     meme_strategy = "价格波动性可能增加，交易决策可以结合市场动量指标。"
                 elif 60 <= meme_pct < 70:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪高度活跃，体现出显著的**资金共识**和高流动性。"
@@ -614,6 +616,7 @@ class ValuationModel:
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。这表明当前资本开支主要用于**增长性扩张**，剔除此因素后，公司核心造血能力强劲。")
+                        # 回滚：价值投资策略
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005):
                         if roic and roic > 0.15:
@@ -631,6 +634,7 @@ class ValuationModel:
                 elif is_hard_tech_growth and use_ps_valuation:
                     lt_status = "观察/成长"
                     if self.strategy == "数据不足" or "风险" in self.strategy:
+                        # 回滚：硬科技策略
                         self.strategy = "当前处于以投入换增长的阶段。重点关注营收增速的持续性以及毛利率的边际改善。"
 
                 if not use_ps_valuation and (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
@@ -716,25 +720,22 @@ class ValuationModel:
                 lt_status = "防御/收息"
                 self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备类似债券的特征。")
 
-            self.long_term_verdict = lt_status
+        self.long_term_verdict = lt_status
 
-            return {
-                "price": price,
-                "beta": beta,
-                "market_regime": self.market_regime,
-                "peg": peg_used,
-                "m_cap": m_cap,
-                "growth_desc": growth_desc,
-                "risk_var": self.risk_var,
-                "meme_pct": meme_pct,
-                "is_profitable": is_profitable_strict 
-            }
-        except Exception as e:
-            logger.error(f"Analyze Error: {e}")
-            return None
+        return {
+            "price": price,
+            "beta": beta,
+            "market_regime": self.market_regime,
+            "peg": peg_used,
+            "m_cap": m_cap,
+            "growth_desc": growth_desc,
+            "risk_var": self.risk_var,
+            "meme_pct": meme_pct,
+            "is_profitable": is_profitable_strict 
+        }
 
 # -------------------------------------------------------------------
-# AnalysisBot 类必须在 bot 实例化之前定义
+# AnalysisBot 类定义
 # -------------------------------------------------------------------
 class AnalysisBot(commands.Bot):
     def __init__(self):
