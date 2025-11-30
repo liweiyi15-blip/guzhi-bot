@@ -129,7 +129,7 @@ def get_earnings_data(ticker):
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     if data:
-        logger.info(f"✅ [API] Earnings fetched: {len(data)} quarters.")
+        logger.info(f"✅ [API] Earnings fetched: {len(data)} quarters (Raw).")
     else:
         logger.warning(f"⚠️ [API] Earnings returned None.")
     return data if data else []
@@ -239,7 +239,7 @@ class ValuationModel:
         r = self.data.get("ratios", {}) or {}
         t = self.data.get("treasury", {}) or {} 
         vix_data = self.data.get("vix", {}) or {}
-        earnings = self.data.get("earnings", []) or []
+        earnings_raw = self.data.get("earnings", []) or []
         cf_list = self.data.get("cf", []) or [] 
         estimates = self.data.get("estimates", []) or []
         
@@ -314,9 +314,10 @@ class ValuationModel:
                 # 1. Sort estimates by date ascending (Older -> Newer)
                 estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
                 
+                # Log Range to confirm data
                 start_date_raw = estimates[0].get("date")
                 end_date_raw = estimates[-1].get("date")
-                logger.info(f"📊 [Estimates] Raw data range detected: {start_date_raw} to {end_date_raw} (Total {len(estimates)} records)")
+                logger.info(f"📊 [Estimates] Raw data range: {start_date_raw} to {end_date_raw}")
 
                 # 2. Filter for FUTURE estimates only
                 today_str = datetime.now().strftime("%Y-%m-%d")
@@ -354,10 +355,7 @@ class ValuationModel:
                     else:
                         logger.warning("⚠️ [Forward] FY1 EPS is negative or None, cannot calculate PE.")
                 else:
-                    if len(future_estimates) == 1:
-                        logger.warning(f"⚠️ [Forward] Only 1 future estimate found ({future_estimates[0]['date']}), need at least 2 for growth calc.")
-                    else:
-                        logger.warning("⚠️ [Forward] No future estimates found (All dates are in the past).")
+                    logger.warning(f"⚠️ [Forward] Not enough future estimates found. Today: {today_str}. Future count: {len(future_estimates)}")
 
             except Exception as e:
                 logger.error(f"❌ Error calculating Forward PEG: {e}")
@@ -751,9 +749,14 @@ class ValuationModel:
             valid_earnings = []
             today_str = datetime.now().strftime("%Y-%m-%d")
             
-            if isinstance(earnings, list):
-                logger.info(f"🔄 Processing Earnings List ({len(earnings)} items)...")
-                for e in earnings:
+            if isinstance(earnings_raw, list):
+                # 优化：只处理和打印最近12个季度（3年）的数据，避免 Rate Limit
+                sorted_earnings = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
+                recent_earnings = sorted_earnings[:12]
+                
+                logger.info(f"🔄 Processing Recent Earnings List ({len(recent_earnings)} items from top)...")
+                
+                for e in recent_earnings:
                     date = e.get("date")
                     if date and date <= today_str:
                         rev = self.extract(e, "revenueActual", f"Earn {date} Rev", default=e.get("revenue"))
