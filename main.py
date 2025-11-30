@@ -115,8 +115,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     return data
 
 def get_estimates_data(ticker):
-    """获取分析师预期数据 (年度) - 严格修正版 URL"""
-    # 按照用户要求：period=annual, limit=10
+    """获取分析师预期数据 (年度) - 严格参数版"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     if data:
@@ -176,16 +175,21 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
 
-    def extract(self, source, key, desc, default=None):
-        """严格的数据提取与日志记录辅助函数"""
+    def extract(self, source, key, desc, default=None, required=True):
+        """
+        智能数据提取函数
+        required=True: 数据缺失会报红色 Warning
+        required=False: 数据缺失仅报蓝色 Info (适用于备用数据)
+        """
         val = source.get(key)
         if val is None:
             if default is not None:
-                # 只有当确实没有值且使用了默认值时，才记录 Info，不再报 Warning
                 logger.info(f"ℹ️ [Info] {desc} ({key}) is None. Using Default: {default}")
                 return default
+            elif not required:
+                logger.info(f"🔹 [Optional] {desc} ({key}) is None. (Skipping)")
+                return None
             else:
-                # 只有当真的缺失且无默认值时，才报 Warning
                 logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
                 return None
         else:
@@ -233,7 +237,7 @@ class ValuationModel:
         return self.data["profile"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑 - 键名修正版"""
+        """核心估值分析逻辑"""
         logger.info("--- 🚀 Starting Calculation Logic ---")
         
         p = self.data.get("profile", {}) or {}
@@ -252,75 +256,73 @@ class ValuationModel:
 
         # === 基础数据提取 ===
         price = self.extract(q, "price", "Quote Price", default=p.get("price"))
-        price_200ma = self.extract(q, "priceAvg200", "200 Day MA")
+        price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
         
         sector = self.extract(p, "sector", "Sector", "Unknown")
         industry = self.extract(p, "industry", "Industry", "Unknown")
-        
         beta = self.extract(p, "beta", "Beta", default=1.0)
-        
-        # Market Cap
         m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
         
-        # EV/EBITDA (优先使用 Ratios 的 enterpriseValueMultipleTTM)
-        ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA (Ratio TTM)")
+        # EV/EBITDA
+        ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA (Ratio)", required=False)
         if ev_ebitda is None:
-            ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA (Metrics TTM)")
+            ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA (Metric)", required=False)
         
-        # FCF Yield (使用正确的 TTM 键名)
-        fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield TTM")
+        # FCF Yield
+        fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield TTM", required=False)
         self.fcf_yield_api = fcf_yield_api 
         
         # Other Metrics
-        roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC TTM")
-        net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM")
-        ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM")
+        roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC TTM", required=False)
+        net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM", required=False)
+        ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM", required=False)
         
-        # PEG / PE (优先 Ratios)
-        peg_ttm = self.extract(r, "pegRatioTTM", "PEG TTM")
-        pe_ttm = self.extract(r, "priceEarningsRatioTTM", "PE TTM")
+        # PEG / PE (Backups)
+        peg_ttm = self.extract(r, "pegRatioTTM", "PEG TTM", required=False)
+        pe_ttm = self.extract(r, "priceEarningsRatioTTM", "PE TTM", required=False)
         
         # Growth
-        ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
-        rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
+        ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM", required=False)
+        rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM", required=False)
 
-        # --- 🚀 Forward PEG Calculation (Smart Intelligent Range) ---
+        # EPS check for logging (Check Profitability)
+        eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
+        is_profitable_ttm = eps_ttm is not None and eps_ttm > 0
+
+        # --- 🚀 Forward PEG Calculation ---
         forward_peg = None
         fwd_pe = None
         fwd_growth = None
         
+        # Helper vars for logging context
+        eps_fy1_val = None 
+        
         if estimates and len(estimates) > 0 and price:
             try:
-                # 1. 智能排序 (确保按时间升序: 旧 -> 新)
                 estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
-                
-                # Log Raw Range
                 start_date_raw = estimates[0].get("date")
                 end_date_raw = estimates[-1].get("date")
                 logger.info(f"📊 [Estimates] Raw data range: {start_date_raw} to {end_date_raw}")
 
-                # 2. 智能筛选未来 (Future Only)
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 future_estimates = [e for e in estimates if e.get("date", "") > today_str]
                 
-                # 3. 智能选择最近的两个未来财年 (FY1, FY2)
                 if len(future_estimates) >= 2:
                     fy1 = future_estimates[0] 
                     fy2 = future_estimates[1] 
                     
-                    date_fy1 = fy1.get("date")
-                    date_fy2 = fy2.get("date")
                     eps_fy1 = fy1.get("epsAvg")
                     eps_fy2 = fy2.get("epsAvg")
+                    eps_fy1_val = eps_fy1 # Store for profitability check
                     
-                    logger.info(f"🔹 [Target] Selected FY1: {date_fy1} | EPS Est: {eps_fy1}")
-                    logger.info(f"🔹 [Target] Selected FY2: {date_fy2} | EPS Est: {eps_fy2}")
+                    logger.info(f"🔹 [Target] Selected FY1: {fy1.get('date')} | EPS Est: {eps_fy1}")
+                    logger.info(f"🔹 [Target] Selected FY2: {fy2.get('date')} | EPS Est: {eps_fy2}")
                     
                     if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
                         fwd_pe = price / eps_fy1
                         fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
                         
-                        logger.info(f"📐 [Calc] Forward PE: {fwd_pe:.2f}x (Price: {price} / EPS: {eps_fy1})")
+                        logger.info(f"📐 [Calc] Forward PE: {fwd_pe:.2f}x")
                         logger.info(f"📐 [Calc] Forward Growth: {fwd_growth:.2%}")
                         
                         if fwd_growth > 0:
@@ -329,14 +331,14 @@ class ValuationModel:
                         else:
                             logger.info(f"ℹ️ [Forward] Growth is negative/zero ({fwd_growth:.2%}), PEG invalid.")
                     else:
-                        logger.warning("⚠️ [Forward] FY1 EPS is negative or None, cannot calculate PE.")
+                        logger.info("ℹ️ [Forward] FY1 EPS is negative or None, cannot calculate Forward PEG.")
                 else:
-                    logger.warning(f"⚠️ [Forward] Not enough future estimates found. Future count: {len(future_estimates)}")
+                    logger.info(f"ℹ️ [Forward] Not enough future estimates found.")
 
             except Exception as e:
                 logger.error(f"❌ Error calculating Forward PEG: {e}")
 
-        # Choose PEG to use (Prefer Forward)
+        # Choose PEG to use
         peg_used = forward_peg if forward_peg is not None else peg_ttm
         is_forward_peg_used = (forward_peg is not None)
         logger.info(f"✅ [Decision] PEG Used: {peg_used} (Is Forward: {is_forward_peg_used})")
@@ -359,15 +361,15 @@ class ValuationModel:
             ttm_dep_amort = 0
             quarter_count = 0
             for i, q_data in enumerate(cf_list): 
-                cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", f"CF Q{i} CFO")
-                dep_amort_q = self.extract(q_data, "depreciationAndAmortization", f"CF Q{i} D&A")
+                cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", f"CF Q{i} CFO", required=False)
+                dep_amort_q = self.extract(q_data, "depreciationAndAmortization", f"CF Q{i} D&A", required=False)
                 
                 if cfo_q is not None and dep_amort_q is not None:
                     ttm_cfo += cfo_q
                     ttm_dep_amort += dep_amort_q
                     quarter_count += 1
                 else:
-                    logger.warning(f"⚠️ CF Data Broken at Q{i}, stopping accumulation.")
+                    logger.info(f"🔹 CF Data incomplete at Q{i}, stopping.")
                     ttm_cfo = 0 
                     break 
 
@@ -379,9 +381,9 @@ class ValuationModel:
                 self.fcf_yield_display = format_percent(adj_fcf_yield) 
                 logger.info(f"✅ [Calculated] Adj FCF Yield: {adj_fcf_yield}")
             else:
-                logger.warning("⚠️ Failed to calculate Adj FCF (Insufficient data).")
+                logger.info("🔹 Failed to calculate Adj FCF (Insufficient data).")
         else:
-            logger.warning("⚠️ Not enough Cash Flow quarters to calculate TTM.")
+            logger.info("🔹 Not enough Cash Flow quarters for TTM.")
             
         fcf_yield_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
         if fcf_yield_used == fcf_yield_api:
@@ -412,7 +414,7 @@ class ValuationModel:
                 is_hard_tech_growth = True
 
         # --- 宏观利率环境 ---
-        yield_10y = self.extract(t, 'year10', "10Y Treasury Yield")
+        yield_10y = self.extract(t, 'year10', "10Y Treasury Yield", required=False)
         macro_discount_factor = 1.0 
         macro_status_log = None
         
@@ -430,7 +432,7 @@ class ValuationModel:
             self.logs.append(macro_status_log)
 
         # --- VIX & 风险 ---
-        vix = self.extract(vix_data, "price", "VIX Price", 20)
+        vix = self.extract(vix_data, "price", "VIX Price", default=20)
         
         if price and beta and vix:
             monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
@@ -439,8 +441,8 @@ class ValuationModel:
         
         # --- Meme 计分 ---
         meme_score = 0
-        vol_today = self.extract(q, "volume", "Volume Today")
-        vol_avg = self.extract(q, "avgVolume", "Avg Volume")
+        vol_today = self.extract(q, "volume", "Volume Today", required=False)
+        vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
         
         if price and price_200ma:
             if price > price_200ma * 1.4: meme_score += 2
@@ -613,10 +615,15 @@ class ValuationModel:
                 
                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
             
-            elif peg_used is not None and peg_used <= 0:
-                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (无效)。当前增长预期为负或亏损。")
+            elif peg_used is None:
+                # 智能判断：如果是亏损导致无法计算 PEG，直接跳过显示（但后台记录）
+                if not is_profitable_ttm and (eps_fy1_val is None or eps_fy1_val <= 0):
+                     logger.info("ℹ️ [Display Skip] PEG hidden because company is loss-making.")
+                     pass # 关键修改：亏损企业不向 self.logs 添加任何 PEG 信息
+                else:
+                     self.logs.append(f"[成长锚点] PEG 数据缺失。")
             else:
-                 self.logs.append(f"[成长锚点] PEG 数据缺失。")
+                 self.logs.append(f"[成长锚点] PEG: {peg_display} (无效)。当前增长预期为负。")
 
             # Meme 信仰
             if is_faith_mode:
