@@ -143,15 +143,23 @@ class ValuationModel:
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
         if val is None:
-            return default
-        return val
+            if default is not None:
+                # logger.info(f"ℹ️ [Info] {desc} ({key}) is None. Using Default: {default}")
+                return default
+            elif not required:
+                # logger.info(f"🔹 [Optional] {desc} ({key}) is None. (Skipping)")
+                return None
+            else:
+                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
+                return None
+        else:
+            # logger.info(f"✅ [Data] {desc}: {val}")
+            return val
 
     async def fetch_data(self, session: aiohttp.ClientSession):
         logger.info(f"--- 🏁 Analysis Start: {self.ticker} ---")
-        
         task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
-        
         tasks_generic = {
             "quote": get_fmp_data(session, "quote", self.ticker, ""),
             "metrics": get_fmp_data(session, "key-metrics-ttm", self.ticker, ""),
@@ -163,53 +171,39 @@ class ValuationModel:
             "earnings": get_earnings_data(session, self.ticker),
             "estimates": get_estimates_data(session, self.ticker)
         }
-        
-        profile_data, treasury_data, *generic_results = await asyncio.gather(
-            task_profile, 
-            task_treasury, 
-            *tasks_generic.values()
-        )
-        
+        profile_data, treasury_data, *generic_results = await asyncio.gather(task_profile, task_treasury, *tasks_generic.values())
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # 1. 汇总 API 状态日志 (一行显示)
+        # 汇总日志状态
         success_keys = []
-        missing_keys = []
-        
-        if profile_data: success_keys.append("Profile")
-        else: missing_keys.append("Profile")
-        
         for k in tasks_generic.keys():
             raw = self.data[k]
             list_keys = ["earnings", "estimates", "cf"]
-            
             if k in list_keys:
                 if isinstance(raw, list) and len(raw) > 0:
                     self.data[k] = raw
                     success_keys.append(k)
                 else:
                     self.data[k] = []
-                    if k != "estimates": missing_keys.append(k)
             else:
                 if isinstance(raw, list) and len(raw) > 0:
                     self.data[k] = raw[0]
                     success_keys.append(k)
                 elif isinstance(raw, list) and len(raw) == 0:
                     self.data[k] = {}
-                    if k != "growth": missing_keys.append(k)
                 elif raw is None:
                     self.data[k] = {}
-                    missing_keys.append(k)
                 else:
                     success_keys.append(k)
 
-        logger.info(f"📡 [API Status] Success: {len(success_keys)} | Missing: {missing_keys}")
+        logger.info(f"📡 [API Status] Success: {len(success_keys)} endpoints.")
         return self.data["profile"] is not None
 
     def analyze(self):
         try:
+            # logger.info("--- 🚀 Starting Calculation Logic ---")
             p = self.data.get("profile", {}) or {}
             q = self.data.get("quote", {}) or {}
             m = self.data.get("metrics", {}) or {} 
@@ -225,34 +219,30 @@ class ValuationModel:
             if not p: return None
 
             # === 1. 基础数据提取 ===
-            price = self.extract(q, "price", default=p.get("price"))
-            price_200ma = self.extract(q, "priceAvg200", required=False)
-            sector = self.extract(p, "sector", default="Unknown")
-            industry = self.extract(p, "industry", default="Unknown")
-            beta = self.extract(p, "beta", default=1.0)
-            m_cap = self.extract(q, "marketCap", default=p.get("mktCap"))
+            price = self.extract(q, "price", "Quote Price", default=p.get("price"))
+            price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
+            sector = self.extract(p, "sector", "Sector", default="Unknown")
+            industry = self.extract(p, "industry", "Industry", default="Unknown")
+            beta = self.extract(p, "beta", "Beta", default=1.0)
+            m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
             
             # === 2. 财务指标 ===
-            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", required=False)
+            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA (Ratio)", required=False)
             if ev_ebitda is None:
-                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", required=False)
+                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA (Metric)", required=False)
             
-            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", required=False)
+            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield TTM", required=False)
             self.fcf_yield_api = fcf_yield_api 
             
-            roic = self.extract(m, "returnOnInvestedCapitalTTM", required=False)
-            net_margin = self.extract(r, "netProfitMarginTTM", required=False)
-            ps_ratio = self.extract(r, "priceToSalesRatioTTM", required=False)
+            roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC TTM", required=False)
+            net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM", required=False)
+            ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM", required=False)
             
-            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", required=False)
-            pe_ttm = self.extract(r, "priceToEarningsRatioTTM", required=False)
+            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM", required=False)
+            pe_ttm = self.extract(r, "priceToEarningsRatioTTM", "PE TTM", required=False)
             
-            ni_growth = self.extract(g, "netIncomeGrowth", required=False)
-            rev_growth = self.extract(g, "revenueGrowth", required=False)
-
-            # === 日志快照：基础数据 ===
-            logger.info(f"📊 [Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
-            logger.info(f"📊 [Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
+            ni_growth = self.extract(g, "netIncomeGrowth", "Net Income Growth", required=False)
+            rev_growth = self.extract(g, "revenueGrowth", "Revenue Growth", required=False)
 
             # 盈利检查
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
@@ -262,16 +252,19 @@ class ValuationModel:
                 if sorted_earnings_for_check:
                     val = sorted_earnings_for_check[0].get("epsActual")
                     latest_eps = val if val is not None else 0
-                    # Log latest earning info
-                    latest = sorted_earnings_for_check[0]
-                    logger.info(f"🔄 [Earnings] Latest: {latest.get('date')} | EPS: {latest.get('epsActual')} (Est: {latest.get('epsEstimated')})")
+                    latest_q = sorted_earnings_for_check[0]
+                    logger.info(f"🔄 [Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')}")
 
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
             
             # 资产负债
-            cash = self.extract(bs, "cashAndCashEquivalents", default=0)
-            debt = self.extract(bs, "totalDebt", default=0)
+            cash = self.extract(bs, "cashAndCashEquivalents", "Cash", required=False, default=0)
+            debt = self.extract(bs, "totalDebt", "Total Debt", required=False, default=0)
             is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
+
+            # 日志快照
+            logger.info(f"📊 [Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta}")
+            logger.info(f"📊 [Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
 
             # === 4. Forward PEG 计算 ===
             forward_peg = None
@@ -319,8 +312,8 @@ class ValuationModel:
                 ttm_dep_amort = 0
                 quarter_count = 0
                 for i, q_data in enumerate(cf_list): 
-                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", required=False)
-                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization", required=False)
+                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", "CFO", required=False)
+                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization", "D&A", required=False)
                     if cfo_q is not None and dep_amort_q is not None:
                         ttm_cfo += cfo_q
                         ttm_dep_amort += dep_amort_q
@@ -352,7 +345,7 @@ class ValuationModel:
                 if not is_blue_ocean: is_hard_tech_growth = True
 
             # --- 宏观利率 ---
-            yield_10y = self.extract(t, 'year10', required=False)
+            yield_10y = self.extract(t, 'year10', "10Y Yield", required=False)
             macro_discount_factor = 1.0 
             macro_status_log = None
             is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe_ttm and pe_ttm > 30)
@@ -368,15 +361,15 @@ class ValuationModel:
             if macro_status_log: self.logs.append(macro_status_log)
 
             # --- VIX ---
-            vix = self.extract(vix_data, "price", default=20)
+            vix = self.extract(vix_data, "price", "VIX", default=20)
             if price and beta and vix:
                 monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
                 self.risk_var = f"-{monthly_risk_pct:.1f}%"
             
             # --- Meme ---
             meme_score = 0
-            vol_today = self.extract(q, "volume", required=False)
-            vol_avg = self.extract(q, "avgVolume", required=False)
+            vol_today = self.extract(q, "volume", "Volume Today", required=False)
+            vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
             if price and price_200ma:
                 if price > price_200ma * 1.4: meme_score += 2
                 elif price > price_200ma * 1.15: meme_score += 1
@@ -447,6 +440,13 @@ class ValuationModel:
                         elif ps_ratio < th_high: st_status = "溢价 (P/S)"; ps_desc = "较高，市场给予了较高的增长溢价"
                         else: st_status = "过热 (P/S)"; ps_desc = "极高，价格已透支未来多年的增长"
                         self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
+                        
+                        if self.strategy == "数据不足":
+                            if ps_ratio < th_fair:
+                                self.strategy = "估值处于合理区间，投资逻辑主要取决于未来的营收增速。"
+                            else:
+                                self.strategy = "当前估值已隐含了极高的增长预期（P/S较高），需警惕业绩不及预期的回调风险。"
+
                 elif ev_ebitda is not None:
                     ratio = ev_ebitda / sector_avg
                     adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -481,7 +481,7 @@ class ValuationModel:
                     self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
             
             if not is_value_trap:
-                # PEG Log (修复 N/A 问题)
+                # PEG Log
                 peg_display = format_num(peg_used) if peg_used is not None else "N/A"
                 peg_status = "N/A"
                 peg_comment = ""
@@ -499,11 +499,8 @@ class ValuationModel:
                         elif peg_used <= 3.0: peg_status = "溢价"; peg_comment = "包含了一定的情绪溢价，但在牛市中可接受。"
                         else: peg_status = "泡沫化风险"; peg_comment = "估值已脱离基本面引力，风险较高。"
                     else: 
-                        # 修复：普通公司 (如 COIN, HOOD) 的 PEG 逻辑
                         if peg_used < 0.8: peg_status = "低估"; peg_comment = "具备极高的安全边际。"
                         elif peg_used <= 1.5: peg_status = "合理"; peg_comment = "估值与增长匹配。"
-                        elif peg_used <= 2.0: peg_status = "偏贵"; peg_comment = "略高于合理区间。"
-                        else: peg_status = "高估"; peg_comment = "缺乏性价比。"
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
                 elif peg_used is None:
                     if not is_profitable_strict and (eps_fy1_val is None or eps_fy1_val <= 0):
