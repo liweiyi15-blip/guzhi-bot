@@ -245,7 +245,6 @@ class ValuationModel:
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             latest_eps = 0
             
-            # 过滤出日期小于等于今天的财报，排除未来的预测数据
             today_str = datetime.now().strftime("%Y-%m-%d")
             past_earnings = []
             if isinstance(earnings_raw, list):
@@ -584,7 +583,9 @@ class ValuationModel:
                             if not has_value_fix_log:
                                 self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
                             if self.strategy == "数据不足" or "风险" in self.strategy:
-                                if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9:
+                                # 修复：增加 PEG 约束，避免高估值公司(如 GOOG PEG 5.39)被误判为黄金窗口
+                                is_peg_safe = peg_used is None or peg_used < 2.2 # 用户要求2.2
+                                if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
                                 else:
                                     if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
