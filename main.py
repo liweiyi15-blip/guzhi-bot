@@ -181,9 +181,11 @@ class ValuationModel:
         val = source.get(key)
         if val is None:
             if default is not None:
-                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None. Using Default: {default}")
+                # 只有当确实没有值且使用了默认值时，才记录 Info，不再报 Warning
+                logger.info(f"ℹ️ [Info] {desc} ({key}) is None. Using Default: {default}")
                 return default
             else:
+                # 只有当真的缺失且无默认值时，才报 Warning
                 logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
                 return None
         else:
@@ -231,7 +233,7 @@ class ValuationModel:
         return self.data["profile"] is not None
 
     def analyze(self):
-        """核心估值分析逻辑"""
+        """核心估值分析逻辑 - 键名修正版"""
         logger.info("--- 🚀 Starting Calculation Logic ---")
         
         p = self.data.get("profile", {}) or {}
@@ -249,59 +251,36 @@ class ValuationModel:
             return None
 
         # === 基础数据提取 ===
-        price_p = self.extract(p, "price", "Profile Price")
-        price_q = self.extract(q, "price", "Quote Price")
-        price = price_q if price_q else price_p
-        
+        price = self.extract(q, "price", "Quote Price", default=p.get("price"))
         price_200ma = self.extract(q, "priceAvg200", "200 Day MA")
         
         sector = self.extract(p, "sector", "Sector", "Unknown")
         industry = self.extract(p, "industry", "Industry", "Unknown")
         
-        beta = self.extract(p, "beta", "Beta")
-        if beta is None: 
-            logger.info("ℹ️ Beta is None, using default 1.0")
-            beta = 1.0 
+        beta = self.extract(p, "beta", "Beta", default=1.0)
         
-        # Market Cap Hierarchy
-        mc_q = self.extract(q, "marketCap", "Quote MarketCap")
-        mc_m = self.extract(m, "marketCap", "Metrics MarketCap")
-        mc_p = self.extract(p, "mktCap", "Profile MarketCap")
-        m_cap = mc_q or mc_m or mc_p or 0
-        logger.info(f"✅ [Data] Final Market Cap Used: {m_cap}")
+        # Market Cap
+        m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
         
-        # EV/EBITDA Hierarchy
-        ev_1 = self.extract(m, "evToEBITDA", "Metrics evToEBITDA")
-        ev_2 = self.extract(m, "enterpriseValueOverEBITDATTM", "Metrics EV/EBITDA TTM")
-        ev_3 = self.extract(r, "enterpriseValueMultipleTTM", "Ratios EV Multiple TTM")
-        ev_ebitda = ev_1 or ev_2 or ev_3
-        logger.info(f"✅ [Data] Final EV/EBITDA Used: {ev_ebitda}")
+        # EV/EBITDA (优先使用 Ratios 的 enterpriseValueMultipleTTM)
+        ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA (Ratio TTM)")
+        if ev_ebitda is None:
+            ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA (Metrics TTM)")
         
-        # FCF Yield
-        fcf_1 = self.extract(m, "freeCashFlowYield", "Metrics FCF Yield")
-        fcf_2 = self.extract(m, "freeCashFlowYieldTTM", "Metrics FCF Yield TTM")
-        fcf_yield_api = fcf_1 or fcf_2
+        # FCF Yield (使用正确的 TTM 键名)
+        fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield TTM")
         self.fcf_yield_api = fcf_yield_api 
-        logger.info(f"✅ [Data] Final FCF Yield API: {fcf_yield_api}")
         
         # Other Metrics
-        roic_1 = self.extract(m, "returnOnInvestedCapital", "Metrics ROIC")
-        roic_2 = self.extract(m, "returnOnInvestedCapitalTTM", "Metrics ROIC TTM")
-        roic = roic_1 if roic_1 is not None else roic_2
-        logger.info(f"✅ [Data] Final ROIC: {roic}")
-
+        roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC TTM")
         net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM")
         ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM")
         
-        # PEG Logic (Forward vs TTM)
-        peg_ttm_1 = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM (Ratios)")
-        peg_ttm_2 = self.extract(r, "pegRatioTTM", "PEG TTM (Alt)")
-        peg_ttm = peg_ttm_1 if peg_ttm_1 is not None else peg_ttm_2
+        # PEG / PE (优先 Ratios)
+        peg_ttm = self.extract(r, "pegRatioTTM", "PEG TTM")
+        pe_ttm = self.extract(r, "priceEarningsRatioTTM", "PE TTM")
         
-        pe_1 = self.extract(r, "priceEarningsRatioTTM", "PE Ratio (Ratios)")
-        pe_2 = self.extract(m, "peRatioTTM", "PE Ratio (Metrics)")
-        pe = pe_1 if pe_1 is not None else pe_2
-        
+        # Growth
         ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
         rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
 
@@ -326,8 +305,8 @@ class ValuationModel:
                 
                 # 3. 智能选择最近的两个未来财年 (FY1, FY2)
                 if len(future_estimates) >= 2:
-                    fy1 = future_estimates[0] # 离现在最近的未来财年
-                    fy2 = future_estimates[1] # 紧接着的下一年
+                    fy1 = future_estimates[0] 
+                    fy2 = future_estimates[1] 
                     
                     date_fy1 = fy1.get("date")
                     date_fy2 = fy2.get("date")
@@ -338,24 +317,21 @@ class ValuationModel:
                     logger.info(f"🔹 [Target] Selected FY2: {date_fy2} | EPS Est: {eps_fy2}")
                     
                     if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
-                        # Calc Forward PE based on FY1
                         fwd_pe = price / eps_fy1
-                        
-                        # Calc Growth Rate (FY1 -> FY2)
                         fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
                         
-                        logger.info(f"📐 [Calc] Forward PE (Price {price:.2f} / FY1 EPS {eps_fy1}): {fwd_pe:.2f}x")
-                        logger.info(f"📐 [Calc] Forward Growth (({eps_fy2} - {eps_fy1}) / {eps_fy1}): {fwd_growth:.2%}")
+                        logger.info(f"📐 [Calc] Forward PE: {fwd_pe:.2f}x (Price: {price} / EPS: {eps_fy1})")
+                        logger.info(f"📐 [Calc] Forward Growth: {fwd_growth:.2%}")
                         
                         if fwd_growth > 0:
                             forward_peg = fwd_pe / (fwd_growth * 100)
                             logger.info(f"✅ [Result] Forward PEG: {forward_peg:.2f}")
                         else:
-                            logger.info(f"ℹ️ [Forward] Growth is negative/zero ({fwd_growth:.2%}), Forward PEG invalid.")
+                            logger.info(f"ℹ️ [Forward] Growth is negative/zero ({fwd_growth:.2%}), PEG invalid.")
                     else:
                         logger.warning("⚠️ [Forward] FY1 EPS is negative or None, cannot calculate PE.")
                 else:
-                    logger.warning(f"⚠️ [Forward] Not enough future estimates found. Today: {today_str}. Future count: {len(future_estimates)}")
+                    logger.warning(f"⚠️ [Forward] Not enough future estimates found. Future count: {len(future_estimates)}")
 
             except Exception as e:
                 logger.error(f"❌ Error calculating Forward PEG: {e}")
@@ -368,7 +344,6 @@ class ValuationModel:
         # Growth Desc Calculation
         growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
         max_growth = max(growth_list) if growth_list else 0
-        logger.info(f"✅ [Data] Max Growth Detected: {max_growth}")
         
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
@@ -441,7 +416,7 @@ class ValuationModel:
         macro_discount_factor = 1.0 
         macro_status_log = None
         
-        is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe and pe > 30)
+        is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe_ttm and pe_ttm > 30)
 
         if is_growth_asset and yield_10y is not None:
             if yield_10y > 4.8:
@@ -791,10 +766,10 @@ class ValuationModel:
             else:
                 self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
             
-            if pe and pe < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
+            if pe_ttm and pe_ttm < 8 and rev_growth and rev_growth < -0.05 and "风险" not in lt_status:
                 self.strategy = "估值看似极低，但营收处于萎缩周期，需要警惕‘低估值陷阱’。"
                 lt_status = "周期性风险"
-                self.logs.append(f"[陷阱] PE ({format_num(pe)}) 虽低，但营收负增长 ({format_percent(rev_growth)})，疑似周期顶部信号。")
+                self.logs.append(f"[陷阱] PE ({format_num(pe_ttm)}) 虽低，但营收负增长 ({format_percent(rev_growth)})，疑似周期顶部信号。")
 
             elif beta and beta < 0.6 and fcf_yield_used and fcf_yield_used > 0.03 and "陷阱" not in self.strategy:
                 self.strategy = "低波动防御性资产，可视为市场震荡环境下的潜在避险配置。"
