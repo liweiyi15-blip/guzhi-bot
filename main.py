@@ -106,7 +106,6 @@ def get_company_profile_smart(ticker):
 
 def get_fmp_data(endpoint, ticker, params=""):
     """通用接口获取函数"""
-    # 构造 URL
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
     if params:
         url += f"&{params}"
@@ -120,7 +119,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     return data
 
 def get_estimates_data(ticker):
-    """获取分析师预期数据 (年度) - 严格参数版 (limit=10, period=annual)"""
+    """获取分析师预期数据 (年度)"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     if data:
@@ -183,8 +182,6 @@ class ValuationModel:
     def extract(self, source, key, desc, default=None, required=True):
         """
         智能数据提取函数
-        required=True: 数据缺失会报红色 Warning
-        required=False: 数据缺失仅报蓝色 Info (适用于备用数据)
         """
         val = source.get(key)
         if val is None:
@@ -209,13 +206,12 @@ class ValuationModel:
         task_profile = loop.run_in_executor(None, get_company_profile_smart, self.ticker)
         task_treasury = loop.run_in_executor(None, get_treasury_rates) 
         
-        # 严格定义接口调用
         tasks_generic = {
             "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
-            # netIncomeGrowthTTM 数据源 -> key-metrics-ttm
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
-            # pegRatioTTM 数据源 -> ratios-ttm
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
+            # 新增：Growth 接口，用于抓取 TTM 增长率 (冷门股必需)
+            "growth": loop.run_in_executor(None, get_fmp_data, "financial-growth", self.ticker, "period=annual&limit=1"),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
@@ -232,14 +228,14 @@ class ValuationModel:
         self.data["treasury"] = treasury_data 
         
         # Unpack lists safely
-        for k in ["quote", "metrics", "ratios", "bs", "vix"]:
+        for k in ["quote", "metrics", "ratios", "bs", "vix", "growth"]:
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
             elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
-                logger.warning(f"⚠️ [Structure] {k} list is empty.")
+                if k != "growth": # growth 为空不报警，因为不是所有票都有
+                    logger.warning(f"⚠️ [Structure] {k} list is empty.")
                 self.data[k] = {} 
             elif self.data[k] is None:
-                logger.warning(f"⚠️ [Structure] {k} is None.")
                 self.data[k] = {}
 
         return self.data["profile"] is not None
@@ -252,6 +248,7 @@ class ValuationModel:
         q = self.data.get("quote", {}) or {}
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
+        g = self.data.get("growth", {}) or {} # 新增 growth 数据源
         t = self.data.get("treasury", {}) or {} 
         vix_data = self.data.get("vix", {}) or {}
         earnings_raw = self.data.get("earnings", []) or []
@@ -286,14 +283,12 @@ class ValuationModel:
         ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM", required=False)
         
         # PEG / PE (Backups)
-        # 严格从 ratios-ttm 获取 pegRatioTTM
-        peg_ttm = self.extract(r, "pegRatioTTM", "PEG TTM", required=False)
-        pe_ttm = self.extract(r, "priceEarningsRatioTTM", "PE TTM", required=False)
+        peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM", required=False)
+        pe_ttm = self.extract(r, "priceToEarningsRatioTTM", "PE TTM", required=False)
         
-        # Growth
-        # 严格从 key-metrics-ttm 获取 netIncomeGrowthTTM
-        ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM", required=False)
-        rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM", required=False)
+        # Growth (从 Financial Growth 接口获取)
+        ni_growth = self.extract(g, "netIncomeGrowth", "Net Income Growth (Annual)", required=False)
+        rev_growth = self.extract(g, "revenueGrowth", "Revenue Growth (Annual)", required=False)
 
         # EPS check for profitability
         eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
@@ -303,8 +298,6 @@ class ValuationModel:
         forward_peg = None
         fwd_pe = None
         fwd_growth = None
-        
-        # Helper vars for logging context
         eps_fy1_val = None 
         
         if estimates and len(estimates) > 0 and price:
@@ -323,7 +316,7 @@ class ValuationModel:
                     
                     eps_fy1 = fy1.get("epsAvg")
                     eps_fy2 = fy2.get("epsAvg")
-                    eps_fy1_val = eps_fy1 # Store for profitability check
+                    eps_fy1_val = eps_fy1 
                     
                     logger.info(f"🔹 [Target] Selected FY1: {fy1.get('date')} | EPS Est: {eps_fy1}")
                     logger.info(f"🔹 [Target] Selected FY2: {fy2.get('date')} | EPS Est: {eps_fy2}")
@@ -353,9 +346,10 @@ class ValuationModel:
         is_forward_peg_used = (forward_peg is not None)
         logger.info(f"✅ [Decision] PEG Used: {peg_used} (Is Forward: {is_forward_peg_used})")
 
-        # Growth Desc Calculation
+        # Growth Desc Calculation (加入了从 Growth 接口获取的数据)
         growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
         max_growth = max(growth_list) if growth_list else 0
+        logger.info(f"✅ [Data] Max Growth Detected: {max_growth}")
         
         growth_desc = "低成长"
         if max_growth > 0.5: growth_desc = "超高速"
@@ -626,10 +620,9 @@ class ValuationModel:
                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
             
             elif peg_used is None:
-                # 智能判断：如果是亏损导致无法计算 PEG，直接跳过显示（但后台记录）
                 if not is_profitable_ttm and (eps_fy1_val is None or eps_fy1_val <= 0):
                      logger.info("ℹ️ [Display Skip] PEG hidden because company is loss-making.")
-                     pass # 关键修改：亏损企业不向 self.logs 添加任何 PEG 信息
+                     # 亏损企业不向 logs 添加 PEG 行，保持界面清爽
                 else:
                      self.logs.append(f"[成长锚点] PEG 数据缺失。")
             else:
