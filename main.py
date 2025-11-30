@@ -1,7 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import requests
+import aiohttp  # 替换 requests
 import os
 import asyncio
 import logging
@@ -36,36 +36,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 数据工具函数 ---
+# --- 1. 异步数据工具函数 (基于 aiohttp) ---
 
-def get_json_safely(url):
-    """安全获取 JSON"""
+async def get_json_safely(session: aiohttp.ClientSession, url: str):
+    """安全获取 JSON (异步)"""
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        if isinstance(data, dict) and "Error Message" in data:
-            logger.warning(f"API Error for {url}: {data['Error Message']}")
-            return None
+        async with session.get(url, timeout=10) as response:
+            if response.status != 200:
+                logger.warning(f"API Status {response.status} for {url}")
+                return None
             
-        if response.status_code != 200:
-            logger.warning(f"API Status {response.status_code} for {url}")
-            return None
-            
-        return data
+            try:
+                data = await response.json()
+            except Exception:
+                # 处理非 JSON 响应或解析错误
+                logger.error(f"Failed to parse JSON from {url}")
+                return None
+
+            if isinstance(data, dict) and "Error Message" in data:
+                logger.warning(f"API Error for {url}: {data['Error Message']}")
+                return None
+                
+            return data
     except Exception as e:
         logger.error(f"Request failed for {url}: {e}")
         return None
 
-def get_treasury_rates():
-    """获取最新的国债收益率"""
+async def get_treasury_rates(session: aiohttp.ClientSession):
+    """获取最新的国债收益率 (异步)"""
     today = datetime.now()
     start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
     
     url = f"{BASE_URL}/treasury-rates?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
     
-    data = get_json_safely(url)
+    data = await get_json_safely(session, url)
     if data and isinstance(data, list) and len(data) > 0:
         logger.info(f"✅ [API] Treasury Data fetched: {len(data)} records.")
         return data[0]
@@ -73,11 +78,11 @@ def get_treasury_rates():
     logger.warning("⚠️ [API] Treasury rates data is empty or failed.")
     return None
 
-def get_company_profile_smart(ticker):
-    """智能获取公司 Profile"""
+async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str):
+    """智能获取公司 Profile (异步)"""
     url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
     logger.info(f"📡 Trying Profile Endpoint: {ticker}")
-    data = get_json_safely(url_profile)
+    data = await get_json_safely(session, url_profile)
     
     if data and isinstance(data, list) and len(data) > 0:
         logger.info(f"✅ [API] Profile Data fetched for {ticker}.")
@@ -85,7 +90,7 @@ def get_company_profile_smart(ticker):
     
     logger.info(f"⚠️ Profile failed. Switching to Screener for {ticker}")
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
-    data_scr = get_json_safely(url_screener)
+    data_scr = await get_json_safely(session, url_screener)
     
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
         item = data_scr[0]
@@ -104,13 +109,13 @@ def get_company_profile_smart(ticker):
     logger.warning(f"⚠️ [API] Profile Data COMPLETELY MISSING for {ticker}.")
     return None
 
-def get_fmp_data(endpoint, ticker, params=""):
-    """通用接口获取函数"""
+async def get_fmp_data(session: aiohttp.ClientSession, endpoint: str, ticker: str, params: str = ""):
+    """通用接口获取函数 (异步)"""
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
     if params:
         url += f"&{params}"
         
-    data = get_json_safely(url)
+    data = await get_json_safely(session, url)
     if data:
         count = len(data) if isinstance(data, list) else (1 if data else 0)
         logger.info(f"✅ [API] {endpoint} fetched: {count} items.")
@@ -118,20 +123,20 @@ def get_fmp_data(endpoint, ticker, params=""):
         logger.warning(f"⚠️ [API] {endpoint} returned None/Empty.")
     return data
 
-def get_estimates_data(ticker):
-    """获取分析师预期数据 (年度)"""
+async def get_estimates_data(session: aiohttp.ClientSession, ticker: str):
+    """获取分析师预期数据 (年度) - 异步"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
-    data = get_json_safely(url)
+    data = await get_json_safely(session, url)
     if data:
         logger.info(f"✅ [API] Estimates fetched: {len(data)} years.")
     else:
         logger.warning(f"⚠️ [API] Estimates returned None.")
     return data if data else []
 
-def get_earnings_data(ticker):
-    """获取历史财报预期与实际数据"""
+async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
+    """获取历史财报预期与实际数据 (异步)"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
-    data = get_json_safely(url)
+    data = await get_json_safely(session, url)
     if data:
         logger.info(f"✅ [API] Earnings fetched: {len(data)} quarters (Raw).")
     else:
@@ -195,35 +200,39 @@ class ValuationModel:
             logger.info(f"✅ [Data] {desc}: {val}")
             return val
 
-    async def fetch_data(self):
-        """异步获取所有 FMP 数据"""
+    async def fetch_data(self, session: aiohttp.ClientSession):
+        """异步获取所有 FMP 数据 (非阻塞并发)"""
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
-        loop = asyncio.get_event_loop()
         
-        task_profile = loop.run_in_executor(None, get_company_profile_smart, self.ticker)
-        task_treasury = loop.run_in_executor(None, get_treasury_rates) 
+        # 并发任务定义
+        task_profile = get_company_profile_smart(session, self.ticker)
+        task_treasury = get_treasury_rates(session)
         
         tasks_generic = {
-            "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
-            "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
-            "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
-            "growth": loop.run_in_executor(None, get_fmp_data, "financial-growth", self.ticker, "period=annual&limit=1"),
-            "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
-            "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
-            "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
-            "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker),
-            "estimates": loop.run_in_executor(None, get_estimates_data, self.ticker)
+            "quote": get_fmp_data(session, "quote", self.ticker, ""),
+            "metrics": get_fmp_data(session, "key-metrics-ttm", self.ticker, ""),
+            "ratios": get_fmp_data(session, "ratios-ttm", self.ticker, ""),
+            "growth": get_fmp_data(session, "financial-growth", self.ticker, "period=annual&limit=1"),
+            "bs": get_fmp_data(session, "balance-sheet-statement", self.ticker, "limit=1"),
+            "cf": get_fmp_data(session, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
+            "vix": get_fmp_data(session, "quote", "^VIX", ""),
+            "earnings": get_earnings_data(session, self.ticker),
+            "estimates": get_estimates_data(session, self.ticker)
         }
         
-        profile_data = await task_profile
-        treasury_data = await task_treasury
-        results_generic = await asyncio.gather(*tasks_generic.values())
+        # 执行并发请求
+        profile_data, treasury_data, *generic_results = await asyncio.gather(
+            task_profile, 
+            task_treasury, 
+            *tasks_generic.values()
+        )
         
-        self.data = dict(zip(tasks_generic.keys(), results_generic))
+        # 组装数据
+        self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # Unpack lists
+        # 解包列表数据
         for k in ["quote", "metrics", "ratios", "bs", "vix", "growth"]:
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
@@ -245,18 +254,18 @@ class ValuationModel:
         m = self.data.get("metrics", {}) or {} 
         r = self.data.get("ratios", {}) or {}
         g = self.data.get("growth", {}) or {} 
-        bs = self.data.get("bs", {}) or {}
         t = self.data.get("treasury", {}) or {} 
         vix_data = self.data.get("vix", {}) or {}
         earnings_raw = self.data.get("earnings", []) or []
         cf_list = self.data.get("cf", []) or [] 
         estimates = self.data.get("estimates", []) or []
+        bs = self.data.get("bs", {}) or {}
         
         if not p: 
             logger.error("🛑 Critical: Profile data missing, aborting analysis.")
             return None
 
-        # === 1. 基础数据 ===
+        # === 1. 基础数据提取 ===
         price = self.extract(q, "price", "Quote Price", default=p.get("price"))
         price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
         sector = self.extract(p, "sector", "Sector", "Unknown")
@@ -284,9 +293,18 @@ class ValuationModel:
 
         # 盈利检查
         eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
-        is_profitable_ttm = eps_ttm is not None and eps_ttm > 0
+        
+        latest_eps = 0
+        if isinstance(earnings_raw, list) and len(earnings_raw) > 0:
+            sorted_earnings_for_check = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
+            if sorted_earnings_for_check:
+                latest_eps = sorted_earnings_for_check[0].get("epsActual", 0)
+                logger.info(f"🔎 [Profit Check] Latest Quarter EPS: {latest_eps}")
 
-        # === 3. 资产负债 (新增科学性检查) ===
+        is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps is not None and latest_eps >= 0)
+        logger.info(f"🔎 [Profit Check] Is Profitable Strict: {is_profitable_strict}")
+
+        # === 3. 资产负债 ===
         cash = self.extract(bs, "cashAndCashEquivalents", "Cash", required=False, default=0)
         debt = self.extract(bs, "totalDebt", "Total Debt", required=False, default=0)
         is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
@@ -421,12 +439,12 @@ class ValuationModel:
         meme_pct = int(meme_score * 10)
         is_faith_mode = meme_pct >= 50
 
-        # === 9. 估值与策略判定 (全逻辑覆盖) ===
+        # === 9. 估值与策略判定 ===
         sector_avg = get_sector_benchmark(sector)
         st_status = "估值合理"
         is_distressed = False
         
-        if is_profitable_ttm:
+        if is_profitable_strict:
             use_ps_valuation = False
         elif is_blue_ocean or is_hard_tech_growth:
             use_ps_valuation = True 
@@ -443,17 +461,14 @@ class ValuationModel:
                  st_status = "极其昂贵/失血"
                  self.logs.append(f"[预警] 自由现金流严重流失且无增长支撑。")
 
-        # 资产负债表因子 (新增)
         if is_cash_rich:
             self.logs.append(f"[资产负债] 公司持有净现金 (现金>债务)，资产负债表健康，抗风险能力强。")
         elif debt and cash and debt > cash * 5:
             self.logs.append(f"[资产负债] 债务负担较重 (债务是现金的5倍以上)，需关注利息支出压力。")
 
-        # 盈利质量因子 (新增)
         if net_margin and net_margin > 0.20:
             self.logs.append(f"[盈利质量] 净利率 ({format_percent(net_margin)}) 极高，展现出强大的产品定价权或成本控制力。")
 
-        # 策略分层
         if not is_distressed:
             if use_ps_valuation:
                 tag = "[蓝海赛道]" if is_blue_ocean else "[硬科技]"
@@ -500,7 +515,7 @@ class ValuationModel:
         
         self.short_term_verdict = st_status
 
-        # --- 长期与最终策略 ---
+        # --- 长期 ---
         lt_status = "中性"
         is_value_trap = False
         if net_margin is not None and net_margin < 0 and price_200ma and price and price < price_200ma:
@@ -512,7 +527,6 @@ class ValuationModel:
                 self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
-            # PEG Log
             peg_display = format_num(peg_used) if peg_used is not None else "N/A"
             peg_status = "N/A"
             peg_comment = ""
@@ -560,15 +574,13 @@ class ValuationModel:
                         peg_comment = "缺乏性价比。"
                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
             elif peg_used is None:
-                if not is_profitable_ttm and (eps_fy1_val is None or eps_fy1_val <= 0):
-                     # 修改：亏损企业 PEG 文案 - 简洁事实
+                if not is_profitable_strict and (eps_fy1_val is None or eps_fy1_val <= 0):
                      self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。公司尚未盈利。")
                 else:
                      self.logs.append(f"[成长锚点] PEG 数据缺失。")
             else:
                  self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。预期业绩在下滑，注意风险。")
 
-            # Meme
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
@@ -590,7 +602,6 @@ class ValuationModel:
                 if "昂贵" in lt_status: lt_status = "高溢价 (资金动量)"
                 if self.strategy == "数据不足": self.strategy = meme_strategy
 
-            # FCF Logic
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
                 is_high_quality_growth = (
@@ -608,12 +619,10 @@ class ValuationModel:
                 elif is_adj_fcf_successful and not use_ps_valuation:
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
-                        # 修改：价值修正文案 (通俗)
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。这表明当前资本开支主要用于**增长性扩张**，剔除此因素后，公司核心造血能力强劲。")
                         if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
                     elif fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005):
                         if roic and roic > 0.15:
-                            # 修改：价值修正文案 (高ROIC)
                             self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，高强度的扩张投入掩盖了其真实的现金流产生能力。")
                         else:
                             self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})，反映出增长性资本支出的积极影响。")
@@ -697,13 +706,9 @@ class ValuationModel:
             else:
                 self.logs.append(f"[Alpha] 暂无有效历史财报数据，无法判断业绩趋势。")
             
-            # --- 补漏策略：平庸/烧钱/周期 ---
             if self.strategy == "数据不足":
-                # 1. 烧钱强推增长 (High Growth, Bad FCF/ROIC)
                 if rev_growth and rev_growth > 0.20 and roic and roic < 0 and fcf_yield_used and fcf_yield_used < -0.02:
                     self.strategy = "增长完全依赖外部输血(烧钱)，且资本效率低下(ROIC为负)。在流动性收紧环境下风险极大，需警惕融资困难。"
-                
-                # 2. 平庸陷阱 (No Growth, No Quality)
                 elif rev_growth and abs(rev_growth) < 0.05 and roic and roic < 0.08 and fcf_yield_used and fcf_yield_used < 0.03:
                     self.strategy = "缺乏增长引擎，且资本回报率平庸。属于典型的‘僵尸股’特征，机会成本较高，建议回避。"
 
@@ -728,7 +733,7 @@ class ValuationModel:
             "growth_desc": growth_desc,
             "risk_var": self.risk_var,
             "meme_pct": meme_pct,
-            "is_profitable": is_profitable_ttm 
+            "is_profitable": is_profitable_strict 
         }
 
 # --- 4. Bot Setup ---
@@ -738,11 +743,18 @@ class AnalysisBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def setup_hook(self):
         logger.info("Syncing commands...")
         await self.tree.sync() 
-        logger.info("Commands synced.")
+        self.session = aiohttp.ClientSession()
+        logger.info("Commands synced & Session created.")
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        await super().close()
 
 bot = AnalysisBot()
 
@@ -762,7 +774,7 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     await interaction.response.defer(thinking=True, ephemeral=ephemeral_result) 
 
     model = ValuationModel(ticker)
-    success = await model.fetch_data()
+    success = await model.fetch_data(interaction.client.session)
     
     if is_privacy_mode and success:
         public_embed = discord.Embed(
