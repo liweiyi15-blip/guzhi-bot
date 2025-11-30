@@ -115,7 +115,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     return data
 
 def get_estimates_data(ticker):
-    """获取分析师预期数据 (用于计算 Forward PEG)"""
+    """获取分析师预期数据 (年度)"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&apikey={FMP_API_KEY}&limit=30&period=annual"
     data = get_json_safely(url)
     if data:
@@ -304,41 +304,61 @@ class ValuationModel:
         ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
         rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
 
-        # --- 🚀 Forward PEG Calculation ---
+        # --- 🚀 Forward PEG Calculation (Dynamic Range) ---
         forward_peg = None
         fwd_pe = None
         fwd_growth = None
         
         if estimates and len(estimates) > 0 and price:
             try:
-                # Filter for future estimates
+                # 1. Sort estimates by date ascending (Older -> Newer)
+                estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
+                
+                start_date_raw = estimates[0].get("date")
+                end_date_raw = estimates[-1].get("date")
+                logger.info(f"📊 [Estimates] Raw data range detected: {start_date_raw} to {end_date_raw} (Total {len(estimates)} records)")
+
+                # 2. Filter for FUTURE estimates only
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 future_estimates = [e for e in estimates if e.get("date", "") > today_str]
-                future_estimates.sort(key=lambda x: x.get("date")) # Sort ascending by date
                 
+                # 3. Dynamic Selection
                 if len(future_estimates) >= 2:
-                    fy1 = future_estimates[0] # Next closest fiscal year end (FY1)
-                    fy2 = future_estimates[1] # The one after that (FY2)
+                    # Take the nearest future year (FY1) and the one after (FY2)
+                    fy1 = future_estimates[0] 
+                    fy2 = future_estimates[1]
                     
+                    date_fy1 = fy1.get("date")
+                    date_fy2 = fy2.get("date")
                     eps_fy1 = fy1.get("epsAvg")
                     eps_fy2 = fy2.get("epsAvg")
                     
-                    logger.info(f"🔮 [Forward] Found Est FY1 ({fy1['date']}): EPS {eps_fy1}")
-                    logger.info(f"🔮 [Forward] Found Est FY2 ({fy2['date']}): EPS {eps_fy2}")
+                    logger.info(f"🔹 [Target] Selected FY1: {date_fy1} (EPS Est: {eps_fy1})")
+                    logger.info(f"🔹 [Target] Selected FY2: {date_fy2} (EPS Est: {eps_fy2})")
                     
-                    if eps_fy1 and eps_fy1 > 0 and eps_fy2 and eps_fy2 > 0:
+                    if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
+                        # Calc Forward PE based on FY1
                         fwd_pe = price / eps_fy1
+                        
+                        # Calc Growth Rate (FY1 -> FY2)
                         fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
+                        
+                        logger.info(f"📐 [Calc] Price: {price:.2f} | FY1 EPS: {eps_fy1} | FY2 EPS: {eps_fy2}")
+                        logger.info(f"📐 [Calc] Implied Forward Growth: {fwd_growth:.2%}")
                         
                         if fwd_growth > 0:
                             forward_peg = fwd_pe / (fwd_growth * 100)
-                            logger.info(f"✅ [Calculated] Forward PEG: {forward_peg:.2f} (PE: {fwd_pe:.1f} / G: {fwd_growth:.1%})")
+                            logger.info(f"✅ [Result] Forward PEG: {forward_peg:.2f}")
                         else:
-                            logger.info(f"ℹ️ [Forward] Negative expected growth ({fwd_growth:.1%}), PEG invalid.")
+                            logger.info(f"ℹ️ [Forward] Growth is negative/zero ({fwd_growth:.2%}), Forward PEG invalid.")
                     else:
-                        logger.warning("⚠️ [Forward] EPS estimates are negative or missing.")
+                        logger.warning("⚠️ [Forward] FY1 EPS is negative or None, cannot calculate PE.")
                 else:
-                    logger.warning("⚠️ [Forward] Not enough future estimates (need at least 2 years).")
+                    if len(future_estimates) == 1:
+                        logger.warning(f"⚠️ [Forward] Only 1 future estimate found ({future_estimates[0]['date']}), need at least 2 for growth calc.")
+                    else:
+                        logger.warning("⚠️ [Forward] No future estimates found (All dates are in the past).")
+
             except Exception as e:
                 logger.error(f"❌ Error calculating Forward PEG: {e}")
 
