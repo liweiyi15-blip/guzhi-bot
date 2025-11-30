@@ -114,6 +114,16 @@ def get_fmp_data(endpoint, ticker, params=""):
         logger.warning(f"⚠️ [API] {endpoint} returned None/Empty.")
     return data
 
+def get_estimates_data(ticker):
+    """获取分析师预期数据 (用于计算 Forward PEG)"""
+    url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&apikey={FMP_API_KEY}&limit=30&period=annual"
+    data = get_json_safely(url)
+    if data:
+        logger.info(f"✅ [API] Estimates fetched: {len(data)} years.")
+    else:
+        logger.warning(f"⚠️ [API] Estimates returned None.")
+    return data if data else []
+
 def get_earnings_data(ticker):
     """获取历史财报预期与实际数据"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
@@ -194,7 +204,8 @@ class ValuationModel:
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": loop.run_in_executor(None, get_fmp_data, "quote", "^VIX", ""),
-            "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker)
+            "earnings": loop.run_in_executor(None, get_earnings_data, self.ticker),
+            "estimates": loop.run_in_executor(None, get_estimates_data, self.ticker)
         }
         
         profile_data = await task_profile
@@ -230,6 +241,7 @@ class ValuationModel:
         vix_data = self.data.get("vix", {}) or {}
         earnings = self.data.get("earnings", []) or []
         cf_list = self.data.get("cf", []) or [] 
+        estimates = self.data.get("estimates", []) or []
         
         if not p: 
             logger.error("🛑 Critical: Profile data missing, aborting analysis.")
@@ -280,10 +292,10 @@ class ValuationModel:
         net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM")
         ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM")
         
-        # PEG/Growth
-        peg_1 = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG Ratio (Ratios)")
-        peg_2 = self.extract(r, "pegRatioTTM", "PEG Ratio (Ratios/Alt)")
-        peg = peg_1 if peg_1 is not None else peg_2
+        # PEG Logic (Forward vs TTM)
+        peg_ttm_1 = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM (Ratios)")
+        peg_ttm_2 = self.extract(r, "pegRatioTTM", "PEG TTM (Alt)")
+        peg_ttm = peg_ttm_1 if peg_ttm_1 is not None else peg_ttm_2
         
         pe_1 = self.extract(r, "priceEarningsRatioTTM", "PE Ratio (Ratios)")
         pe_2 = self.extract(m, "peRatioTTM", "PE Ratio (Metrics)")
@@ -291,19 +303,52 @@ class ValuationModel:
         
         ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
         rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
+
+        # --- 🚀 Forward PEG Calculation ---
+        forward_peg = None
+        fwd_pe = None
+        fwd_growth = None
         
-        if peg is None and pe and ni_growth and ni_growth > 0:
-            try: 
-                peg = pe / (ni_growth * 100)
-                logger.info(f"ℹ️ Calculated PEG manually: {peg}")
-            except: pass
+        if estimates and len(estimates) > 0 and price:
+            try:
+                # Filter for future estimates
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                future_estimates = [e for e in estimates if e.get("date", "") > today_str]
+                future_estimates.sort(key=lambda x: x.get("date")) # Sort ascending by date
+                
+                if len(future_estimates) >= 2:
+                    fy1 = future_estimates[0] # Next closest fiscal year end (FY1)
+                    fy2 = future_estimates[1] # The one after that (FY2)
+                    
+                    eps_fy1 = fy1.get("epsAvg")
+                    eps_fy2 = fy2.get("epsAvg")
+                    
+                    logger.info(f"🔮 [Forward] Found Est FY1 ({fy1['date']}): EPS {eps_fy1}")
+                    logger.info(f"🔮 [Forward] Found Est FY2 ({fy2['date']}): EPS {eps_fy2}")
+                    
+                    if eps_fy1 and eps_fy1 > 0 and eps_fy2 and eps_fy2 > 0:
+                        fwd_pe = price / eps_fy1
+                        fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
+                        
+                        if fwd_growth > 0:
+                            forward_peg = fwd_pe / (fwd_growth * 100)
+                            logger.info(f"✅ [Calculated] Forward PEG: {forward_peg:.2f} (PE: {fwd_pe:.1f} / G: {fwd_growth:.1%})")
+                        else:
+                            logger.info(f"ℹ️ [Forward] Negative expected growth ({fwd_growth:.1%}), PEG invalid.")
+                    else:
+                        logger.warning("⚠️ [Forward] EPS estimates are negative or missing.")
+                else:
+                    logger.warning("⚠️ [Forward] Not enough future estimates (need at least 2 years).")
+            except Exception as e:
+                logger.error(f"❌ Error calculating Forward PEG: {e}")
 
-        implied_growth = 0
-        if peg and pe and peg > 0:
-            implied_growth = (pe / peg) / 100.0
-            logger.info(f"ℹ️ Calculated Implied Growth: {implied_growth}")
+        # Choose PEG to use (Prefer Forward)
+        peg_used = forward_peg if forward_peg is not None else peg_ttm
+        is_forward_peg_used = (forward_peg is not None)
+        logger.info(f"✅ [Decision] PEG Used: {peg_used} (Is Forward: {is_forward_peg_used})")
 
-        growth_list = [x for x in [rev_growth, ni_growth, implied_growth] if x is not None]
+        # Growth Desc Calculation
+        growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
         max_growth = max(growth_list) if growth_list else 0
         logger.info(f"✅ [Data] Max Growth Detected: {max_growth}")
         
@@ -311,7 +356,7 @@ class ValuationModel:
         if max_growth > 0.5: growth_desc = "超高速"
         elif max_growth > 0.2: growth_desc = "高速"
         elif max_growth > 0.05: growth_desc = "稳健"
-        if peg and peg > 3.0: growth_desc = "高预期"
+        if peg_used and peg_used > 3.0: growth_desc = "高预期"
         
         # --- Adjusted FCF Yield ---
         adj_fcf_yield = None
@@ -417,14 +462,14 @@ class ValuationModel:
             
         if price and price_200ma and price > price_200ma:
             bad_fcf = (fcf_yield_api is not None and fcf_yield_api < 0.01)
-            bad_peg = (peg is not None and (peg < 0 or peg > 4.0))
+            bad_peg = (peg_used is not None and (peg_used < 0 or peg_used > 4.0))
             if bad_fcf or bad_peg: meme_score += 2
             
         if vol_today and vol_avg and vol_avg > 0:
             if vol_today > vol_avg * 1.2: meme_score += 1
         
         if roic and roic > 0.20:
-            if peg and 0 < peg < 3.0: meme_score -= 3
+            if peg_used and 0 < peg_used < 3.0: meme_score -= 3
             else: meme_score -= 1
         
         meme_score = max(0, min(10, meme_score))
@@ -492,14 +537,14 @@ class ValuationModel:
                 ratio = ev_ebitda / sector_avg
                 adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
 
-                if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 1.5):
+                if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 1.5):
                     st_status = "便宜 (高成长)"
-                    self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg)}) 极低，属于越涨越便宜。")
+                    self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg_used)}) 极低，属于越涨越便宜。")
                 elif adjusted_ratio < 0.7:
                     st_status = "便宜"
                     self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
                 elif adjusted_ratio > 1.3:
-                    if ("高速" in growth_desc or "预期" in growth_desc) and (peg is not None and 0 < peg < 2.0):
+                    if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 2.0):
                         st_status = "合理溢价"
                         self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
                     else:
@@ -524,26 +569,61 @@ class ValuationModel:
                 self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
-            # PEG
-            if peg is not None and peg > 0:
-                peg_strict = peg / macro_discount_factor
-                if is_blue_ocean:
-                    if peg_strict < 1.0: 
-                        self.logs.append(f"[爆发前夜] PEG ({format_num(peg)}) 极低。对于指数级增长行业，这通常意味着**极度低估**。")
-                    elif peg_strict < 4.0:
-                        self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 在蓝海赛道属合理区间。")
-                    elif peg_strict > 8.0:
-                        self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 极高，需警惕预期透支。")
-                else:
-                    if peg_strict < 0.8:
-                        self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于低位，暗示市场低估了公司的未来成长潜力。")
-                    elif peg_strict > 2.5:
-                        self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 较高，意味着当前的股价已经包含了**极高的未来增长预期**。")
-                    else:
-                        self.logs.append(f"[成长估值] PEG ({format_num(peg)}) 处于合理区间，与公司的{growth_desc}相匹配。")
+            # === PEG 常驻因子逻辑 (分段评分 - Forward优先) ===
+            peg_display = format_num(peg_used) if peg_used is not None else "N/A"
+            peg_status = "N/A"
+            peg_comment = ""
+            peg_type_str = "Forward" if is_forward_peg_used else "TTM"
             
-            elif (peg is None or peg <= 0) and is_blue_ocean:
-                 self.logs.append(f"[爆发前夜] 由于当前处于投入期（净利为负），PEG 暂时不适用，重点关注营收爆发力。")
+            if peg_used is not None and peg_used > 0:
+                if is_blue_ocean: 
+                    if peg_used < 0.5: 
+                        peg_status = "极低/数据失真"
+                        peg_comment = "基数过小可能导致失真，参考意义有限。"
+                    elif peg_used < 1.5:
+                        peg_status = "低估"
+                        peg_comment = f"相对于未来的爆发潜力，当前价格处于低位 ({peg_type_str})。"
+                    elif peg_used <= 4.0:
+                        peg_status = "合理 (高容忍)"
+                        peg_comment = f"市场给予蓝海赛道极高的增长容忍度 ({peg_type_str})。"
+                    else:
+                        peg_status = "高估/透支"
+                        peg_comment = "预期已大幅透支，需警惕回调。"
+                
+                elif is_hard_tech_growth: 
+                    if peg_used < 1.0:
+                        peg_status = "极度低估/罕见"
+                        peg_comment = f"对于硬科技资产，此 {peg_type_str} PEG 属于罕见的低估区间。"
+                    elif peg_used <= 2.0:
+                        peg_status = "合理 (GARP)"
+                        peg_comment = f"属于合理的成长股估值区间 ({peg_type_str})。"
+                    elif peg_used <= 3.0:
+                        peg_status = "溢价"
+                        peg_comment = "包含了一定的情绪溢价，但在牛市中可接受。"
+                    else:
+                        peg_status = "泡沫化风险"
+                        peg_comment = "估值已脱离基本面引力，风险较高。"
+                
+                else: # 传统
+                    if peg_used < 0.8:
+                        peg_status = "低估"
+                        peg_comment = "具备极高的安全边际。"
+                    elif peg_used <= 1.5:
+                        peg_status = "合理"
+                        peg_comment = "估值与增长匹配。"
+                    elif peg_used <= 2.0:
+                        peg_status = "偏贵"
+                        peg_comment = "略高于合理区间。"
+                    else:
+                        peg_status = "高估"
+                        peg_comment = "缺乏性价比。"
+                
+                self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
+            
+            elif peg_used is not None and peg_used <= 0:
+                 self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (无效)。当前增长预期为负或亏损。")
+            else:
+                 self.logs.append(f"[成长锚点] PEG 数据缺失。")
 
             # Meme 信仰
             if is_faith_mode:
@@ -647,7 +727,7 @@ class ValuationModel:
             if fcf_yield_used is None and not use_ps_valuation:
                 self.logs.append(f"[预警] FCF Yield 数据缺失，无法进行基于现金流的长期估值。")
 
-            # --- [趋势追踪] ---
+            # --- [扭亏/业绩追踪] ---
             valid_earnings = []
             today_str = datetime.now().strftime("%Y-%m-%d")
             
@@ -667,27 +747,13 @@ class ValuationModel:
             recent_4 = trend_data[-4:] 
             
             if len(recent_4) >= 3:
-                # Revenue
-                r_now = recent_4[-1]["rev"]
-                r_prev = recent_4[-2]["rev"]
-                r_prev2 = recent_4[-3]["rev"]
-                
-                if r_prev > 0 and r_prev2 > 0:
-                    growth_now = (r_now - r_prev) / r_prev
-                    growth_prev = (r_prev - r_prev2) / r_prev2
-                    
-                    if growth_now > growth_prev * 1.2:
-                        self.logs.append(f"[趋势追踪] **营收加速 (环比)**。最近一季营收环比增速 ({format_percent(growth_now)}) 显著高于前季 ({format_percent(growth_prev)})。")
-                    elif growth_now < growth_prev * 0.8:
-                        self.logs.append(f"[趋势追踪] 营收环比增速放缓。")
-
-                # Earnings
+                # Earnings 扭亏逻辑
                 epss = [x["eps"] for x in recent_4]
                 if all(e < 0 for e in epss[:-1]) and epss[-1] > 0:
-                    self.logs.append(f"[趋势追踪] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
+                    self.logs.append(f"[反转信号] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
                 elif all(e < 0 for e in epss):
                     if epss[-1] > epss[-2]:
-                        self.logs.append(f"[趋势追踪] 亏损环比收窄。经营效率提升，距离盈利平衡点渐近。")
+                        self.logs.append(f"[反转信号] 亏损环比收窄。经营效率提升，距离盈利平衡点渐近。")
 
             # [Alpha]
             if len(recent_4) > 0:
@@ -718,7 +784,7 @@ class ValuationModel:
             "price": price,
             "beta": beta,
             "market_regime": self.market_regime,
-            "peg": peg,
+            "peg": peg_used,
             "m_cap": m_cap,
             "growth_desc": growth_desc,
             "risk_var": self.risk_var,
