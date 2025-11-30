@@ -105,7 +105,12 @@ def get_company_profile_smart(ticker):
     return None
 
 def get_fmp_data(endpoint, ticker, params=""):
-    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}&{params}"
+    """通用接口获取函数"""
+    # 构造 URL
+    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
+    if params:
+        url += f"&{params}"
+        
     data = get_json_safely(url)
     if data:
         count = len(data) if isinstance(data, list) else (1 if data else 0)
@@ -115,7 +120,7 @@ def get_fmp_data(endpoint, ticker, params=""):
     return data
 
 def get_estimates_data(ticker):
-    """获取分析师预期数据 (年度) - 严格参数版"""
+    """获取分析师预期数据 (年度) - 严格参数版 (limit=10, period=annual)"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     if data:
@@ -204,9 +209,12 @@ class ValuationModel:
         task_profile = loop.run_in_executor(None, get_company_profile_smart, self.ticker)
         task_treasury = loop.run_in_executor(None, get_treasury_rates) 
         
+        # 严格定义接口调用
         tasks_generic = {
             "quote": loop.run_in_executor(None, get_fmp_data, "quote", self.ticker, ""),
+            # netIncomeGrowthTTM 数据源 -> key-metrics-ttm
             "metrics": loop.run_in_executor(None, get_fmp_data, "key-metrics-ttm", self.ticker, ""),
+            # pegRatioTTM 数据源 -> ratios-ttm
             "ratios": loop.run_in_executor(None, get_fmp_data, "ratios-ttm", self.ticker, ""),
             "bs": loop.run_in_executor(None, get_fmp_data, "balance-sheet-statement", self.ticker, "limit=1"),
             "cf": loop.run_in_executor(None, get_fmp_data, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
@@ -278,14 +286,16 @@ class ValuationModel:
         ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM", required=False)
         
         # PEG / PE (Backups)
+        # 严格从 ratios-ttm 获取 pegRatioTTM
         peg_ttm = self.extract(r, "pegRatioTTM", "PEG TTM", required=False)
         pe_ttm = self.extract(r, "priceEarningsRatioTTM", "PE TTM", required=False)
         
         # Growth
+        # 严格从 key-metrics-ttm 获取 netIncomeGrowthTTM
         ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM", required=False)
         rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM", required=False)
 
-        # EPS check for logging (Check Profitability)
+        # EPS check for profitability
         eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
         is_profitable_ttm = eps_ttm is not None and eps_ttm > 0
 
