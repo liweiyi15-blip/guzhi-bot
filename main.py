@@ -174,9 +174,7 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # 关键修复：区分单条数据和列表数据
-        list_keys = ["earnings", "estimates", "cf"] # 这些必须保持列表结构
-        
+        # 1. 汇总 API 状态日志
         success_keys = []
         missing_keys = []
         
@@ -185,17 +183,17 @@ class ValuationModel:
         
         for k in tasks_generic.keys():
             raw = self.data[k]
+            # 区分单条与列表
+            list_keys = ["earnings", "estimates", "cf"]
             
             if k in list_keys:
-                # 列表类型：保持原样
                 if isinstance(raw, list) and len(raw) > 0:
                     self.data[k] = raw
                     success_keys.append(k)
                 else:
                     self.data[k] = []
-                    missing_keys.append(k)
+                    if k != "estimates": missing_keys.append(k)
             else:
-                # 单条类型：解包
                 if isinstance(raw, list) and len(raw) > 0:
                     self.data[k] = raw[0]
                     success_keys.append(k)
@@ -265,6 +263,9 @@ class ValuationModel:
                 if sorted_earnings_for_check:
                     val = sorted_earnings_for_check[0].get("epsActual")
                     latest_eps = val if val is not None else 0
+                if len(sorted_earnings_for_check) > 0:
+                    latest = sorted_earnings_for_check[0]
+                    logger.info(f"🔄 [Earnings] Latest: {latest.get('date')} | EPS: {latest.get('epsActual')} (Est: {latest.get('epsEstimated')})")
 
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
             
@@ -447,6 +448,14 @@ class ValuationModel:
                         elif ps_ratio < th_high: st_status = "溢价 (P/S)"; ps_desc = "较高，市场给予了较高的增长溢价"
                         else: st_status = "过热 (P/S)"; ps_desc = "极高，价格已透支未来多年的增长"
                         self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
+                        
+                        # 补漏：如果还没赋值策略，补充一个 P/S 策略
+                        if self.strategy == "数据不足":
+                            if ps_ratio < th_fair:
+                                self.strategy = "估值处于合理区间，投资逻辑主要取决于未来的营收增速。"
+                            else:
+                                self.strategy = "当前估值已隐含了极高的增长预期（P/S较高），需警惕业绩不及预期的回调风险。"
+
                 elif ev_ebitda is not None:
                     ratio = ev_ebitda / sector_avg
                     adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -481,6 +490,7 @@ class ValuationModel:
                     self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
             
             if not is_value_trap:
+                # PEG Log
                 peg_display = format_num(peg_used) if peg_used is not None else "N/A"
                 peg_status = "N/A"
                 peg_comment = ""
@@ -513,7 +523,6 @@ class ValuationModel:
                 if is_faith_mode:
                     meme_log = ""
                     meme_strategy_text = "价格波动性可能增加，交易决策可以结合市场动量指标。"
-
                     if 50 <= meme_pct < 60:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
                     elif 60 <= meme_pct < 70:
@@ -538,11 +547,7 @@ class ValuationModel:
                 # FCF Logic
                 if fcf_yield_used is not None:
                     fcf_str = self.fcf_yield_display
-                    is_high_quality_growth = (
-                        ("高速" in growth_desc or "超高速" in growth_desc or 
-                        ("稳健" in growth_desc and roic is not None and roic > 0.20))
-                        and roic is not None and roic > 0.15
-                    )
+                    is_high_quality_growth = (("高速" in growth_desc or "超高速" in growth_desc or ("稳健" in growth_desc and roic is not None and roic > 0.20)) and roic is not None and roic > 0.15)
                     is_adj_fcf_successful = adj_fcf_yield is not None
                     
                     if is_adj_fcf_successful and use_ps_valuation:
@@ -567,7 +572,6 @@ class ValuationModel:
                             self.logs.append(f"[护城河] 处于竞争不充分的蓝海市场，行业壁垒极高，稀缺性溢价合理。")
                         if self.strategy == "数据不足" or "风险" in self.strategy:
                             self.strategy = "估值锚点在于远期市场垄断地位。短期受资金情绪影响大，适合在技术回调时分批布局，非信徒需谨慎。"
-                    
                     elif is_hard_tech_growth and use_ps_valuation:
                         lt_status = "观察/成长"
                         if self.strategy == "数据不足" or "风险" in self.strategy:
@@ -591,7 +595,7 @@ class ValuationModel:
                                 if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
                                 else:
-                                    # 巨头策略优化
+                                    # 巨头策略 (AMZN/GOOG)
                                     if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
                                         if ev_ebitda is not None and ev_ebitda < 25:
                                             self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
@@ -614,10 +618,6 @@ class ValuationModel:
                 if isinstance(earnings_raw, list):
                     sorted_earnings = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
                     recent_earnings = sorted_earnings[:12]
-                    if recent_earnings:
-                        latest_q = recent_earnings[0]
-                        logger.info(f"🔄 [Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')} (Est: {latest_q.get('epsEstimated')})")
-                    
                     for e in recent_earnings:
                         date = e.get("date")
                         if date and date <= today_str:
