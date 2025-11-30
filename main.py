@@ -194,7 +194,9 @@ class ValuationModel:
                 else:
                     success_keys.append(k)
 
-        logger.info(f"[API Status] Success: {len(success_keys)} endpoints.")
+        total_endpoints = len(tasks_generic)
+        failed_count = total_endpoints - len(success_keys)
+        logger.info(f"[API Status] Success: {len(success_keys)} | Failed: {failed_count} endpoints.")
         return self.data["profile"] is not None
 
     def analyze(self):
@@ -239,16 +241,24 @@ class ValuationModel:
             ni_growth = self.extract(g, "netIncomeGrowth", "NI Growth", required=False)
             rev_growth = self.extract(g, "revenueGrowth", "Rev Growth", required=False)
 
-            # 盈利检查
+            # 盈利检查 & 日志修复
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             latest_eps = 0
-            if isinstance(earnings_raw, list) and len(earnings_raw) > 0:
-                sorted_earnings_for_check = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
-                if sorted_earnings_for_check:
-                    val = sorted_earnings_for_check[0].get("epsActual")
-                    latest_eps = val if val is not None else 0
-                    latest_q = sorted_earnings_for_check[0]
-                    logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')}")
+            
+            # 过滤出日期小于等于今天的财报，排除未来的预测数据
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            past_earnings = []
+            if isinstance(earnings_raw, list):
+                past_earnings = [e for e in earnings_raw if e.get("date", "9999-99-99") <= today_str]
+            
+            if past_earnings:
+                sorted_earnings_for_check = sorted(past_earnings, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
+                latest_q = sorted_earnings_for_check[0]
+                val = latest_q.get("epsActual")
+                latest_eps = val if val is not None else 0
+                logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {val}")
+            else:
+                logger.info("[Earnings] No past earnings data found.")
 
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
             
@@ -270,7 +280,6 @@ class ValuationModel:
             if estimates and len(estimates) > 0 and price:
                 try:
                     estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
-                    today_str = datetime.now().strftime("%Y-%m-%d")
                     future_estimates = [e for e in estimates if e.get("date", "") > today_str]
                     
                     if len(future_estimates) >= 2:
@@ -500,7 +509,6 @@ class ValuationModel:
                 elif peg_used is None:
                      self.logs.append(f"[成长锚点] PEG 数据缺失。")
                 else:
-                    # 针对 NIO 等负PEG情况的修改
                      self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display}。公司处于亏损或盈利不稳定阶段，PEG指标参考性较弱，建议更多关注营收增速与现金流状况。")
 
                 # Meme
@@ -569,7 +577,8 @@ class ValuationModel:
                             lt_status = "昂贵"
                             self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                             if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
-                        elif roic and roic > 0.20 and not is_faith_mode:
+                        
+                        elif roic and roic > 0.20 and (not is_faith_mode or (is_giant and meme_pct < 80)):
                             lt_status = "优质/值得等待"
                             has_value_fix_log = any("[价值修正]" in x for x in self.logs)
                             if not has_value_fix_log:
@@ -582,7 +591,6 @@ class ValuationModel:
                                         if ev_ebitda is not None and ev_ebitda < 25:
                                             self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
                                         else:
-                                            # AMZN/GOOG 策略调整
                                             self.strategy = "公司展现出卓越的自由现金流创造能力与行业统治力。当前估值虽有溢价，但反映了市场对其确定性的认可。策略上视其为核心底仓配置，重点通过长期持有以通过业绩增长消化估值，而非博弈短期波动。"
                                     else:
                                         self.strategy = "行业地位稳固，护城河极深。当前估值与增长潜力匹配度高，属于典型的‘核心资产’。适合作为长期底仓，赚取业绩增长的钱。"
@@ -604,7 +612,6 @@ class ValuationModel:
                     for e in recent_earnings:
                         date = e.get("date")
                         if date and date <= today_str:
-                            # 修复报错的核心代码
                             rev = self.extract(e, "revenueActual", "Revenue", default=e.get("revenue"))
                             eps = self.extract(e, "epsActual", "EPS")
                             est = self.extract(e, "epsEstimated", "EPS Est")
