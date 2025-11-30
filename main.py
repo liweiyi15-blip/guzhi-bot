@@ -140,7 +140,7 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
 
-    def extract(self, source, key, default=None):
+    def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
         if val is None:
             return default
@@ -174,7 +174,7 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # 1. 汇总 API 状态日志
+        # 1. 汇总 API 状态日志 (一行显示)
         success_keys = []
         missing_keys = []
         
@@ -183,7 +183,6 @@ class ValuationModel:
         
         for k in tasks_generic.keys():
             raw = self.data[k]
-            # 区分单条与列表
             list_keys = ["earnings", "estimates", "cf"]
             
             if k in list_keys:
@@ -227,29 +226,29 @@ class ValuationModel:
 
             # === 1. 基础数据提取 ===
             price = self.extract(q, "price", default=p.get("price"))
-            price_200ma = self.extract(q, "priceAvg200")
+            price_200ma = self.extract(q, "priceAvg200", required=False)
             sector = self.extract(p, "sector", default="Unknown")
             industry = self.extract(p, "industry", default="Unknown")
             beta = self.extract(p, "beta", default=1.0)
             m_cap = self.extract(q, "marketCap", default=p.get("mktCap"))
             
             # === 2. 财务指标 ===
-            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM")
+            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", required=False)
             if ev_ebitda is None:
-                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM")
+                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", required=False)
             
-            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM")
+            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", required=False)
             self.fcf_yield_api = fcf_yield_api 
             
-            roic = self.extract(m, "returnOnInvestedCapitalTTM")
-            net_margin = self.extract(r, "netProfitMarginTTM")
-            ps_ratio = self.extract(r, "priceToSalesRatioTTM")
+            roic = self.extract(m, "returnOnInvestedCapitalTTM", required=False)
+            net_margin = self.extract(r, "netProfitMarginTTM", required=False)
+            ps_ratio = self.extract(r, "priceToSalesRatioTTM", required=False)
             
-            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM")
-            pe_ttm = self.extract(r, "priceToEarningsRatioTTM")
+            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", required=False)
+            pe_ttm = self.extract(r, "priceToEarningsRatioTTM", required=False)
             
-            ni_growth = self.extract(g, "netIncomeGrowth")
-            rev_growth = self.extract(g, "revenueGrowth")
+            ni_growth = self.extract(g, "netIncomeGrowth", required=False)
+            rev_growth = self.extract(g, "revenueGrowth", required=False)
 
             # === 日志快照：基础数据 ===
             logger.info(f"📊 [Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
@@ -263,7 +262,7 @@ class ValuationModel:
                 if sorted_earnings_for_check:
                     val = sorted_earnings_for_check[0].get("epsActual")
                     latest_eps = val if val is not None else 0
-                if len(sorted_earnings_for_check) > 0:
+                    # Log latest earning info
                     latest = sorted_earnings_for_check[0]
                     logger.info(f"🔄 [Earnings] Latest: {latest.get('date')} | EPS: {latest.get('epsActual')} (Est: {latest.get('epsEstimated')})")
 
@@ -320,8 +319,8 @@ class ValuationModel:
                 ttm_dep_amort = 0
                 quarter_count = 0
                 for i, q_data in enumerate(cf_list): 
-                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities")
-                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization")
+                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", required=False)
+                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization", required=False)
                     if cfo_q is not None and dep_amort_q is not None:
                         ttm_cfo += cfo_q
                         ttm_dep_amort += dep_amort_q
@@ -353,7 +352,7 @@ class ValuationModel:
                 if not is_blue_ocean: is_hard_tech_growth = True
 
             # --- 宏观利率 ---
-            yield_10y = self.extract(t, 'year10')
+            yield_10y = self.extract(t, 'year10', required=False)
             macro_discount_factor = 1.0 
             macro_status_log = None
             is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe_ttm and pe_ttm > 30)
@@ -376,8 +375,8 @@ class ValuationModel:
             
             # --- Meme ---
             meme_score = 0
-            vol_today = self.extract(q, "volume")
-            vol_avg = self.extract(q, "avgVolume")
+            vol_today = self.extract(q, "volume", required=False)
+            vol_avg = self.extract(q, "avgVolume", required=False)
             if price and price_200ma:
                 if price > price_200ma * 1.4: meme_score += 2
                 elif price > price_200ma * 1.15: meme_score += 1
@@ -448,14 +447,6 @@ class ValuationModel:
                         elif ps_ratio < th_high: st_status = "溢价 (P/S)"; ps_desc = "较高，市场给予了较高的增长溢价"
                         else: st_status = "过热 (P/S)"; ps_desc = "极高，价格已透支未来多年的增长"
                         self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
-                        
-                        # 补漏：如果还没赋值策略，补充一个 P/S 策略
-                        if self.strategy == "数据不足":
-                            if ps_ratio < th_fair:
-                                self.strategy = "估值处于合理区间，投资逻辑主要取决于未来的营收增速。"
-                            else:
-                                self.strategy = "当前估值已隐含了极高的增长预期（P/S较高），需警惕业绩不及预期的回调风险。"
-
                 elif ev_ebitda is not None:
                     ratio = ev_ebitda / sector_avg
                     adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -490,7 +481,7 @@ class ValuationModel:
                     self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
             
             if not is_value_trap:
-                # PEG Log
+                # PEG Log (修复 N/A 问题)
                 peg_display = format_num(peg_used) if peg_used is not None else "N/A"
                 peg_status = "N/A"
                 peg_comment = ""
@@ -508,8 +499,11 @@ class ValuationModel:
                         elif peg_used <= 3.0: peg_status = "溢价"; peg_comment = "包含了一定的情绪溢价，但在牛市中可接受。"
                         else: peg_status = "泡沫化风险"; peg_comment = "估值已脱离基本面引力，风险较高。"
                     else: 
+                        # 修复：普通公司 (如 COIN, HOOD) 的 PEG 逻辑
                         if peg_used < 0.8: peg_status = "低估"; peg_comment = "具备极高的安全边际。"
                         elif peg_used <= 1.5: peg_status = "合理"; peg_comment = "估值与增长匹配。"
+                        elif peg_used <= 2.0: peg_status = "偏贵"; peg_comment = "略高于合理区间。"
+                        else: peg_status = "高估"; peg_comment = "缺乏性价比。"
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
                 elif peg_used is None:
                     if not is_profitable_strict and (eps_fy1_val is None or eps_fy1_val <= 0):
@@ -595,12 +589,8 @@ class ValuationModel:
                                 if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
                                 else:
-                                    # 巨头策略 (AMZN/GOOG)
-                                    if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
-                                        if ev_ebitda is not None and ev_ebitda < 25:
-                                            self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
-                                        else:
-                                            self.strategy = "拥有强大的造血能力，但当前估值包含了一定溢价。属于‘优质但不便宜’的核心资产，适合长期持有以消化估值。"
+                                    if is_giant and adj_fcf_yield and adj_fcf_yield > 0.03:
+                                        self.strategy = "EV/EBITDA 显示其估值处于合理区间，并未出现明显泡沫。强大的经营现金流支撑了当前市值，属于‘价格公道的好公司’，适合稳健配置。"
                                     else:
                                         self.strategy = "行业地位稳固，护城河极深。当前估值与增长潜力匹配度高，属于典型的‘核心资产’。适合作为长期底仓，赚取业绩增长的钱。"
 
