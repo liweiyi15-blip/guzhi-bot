@@ -1,7 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import aiohttp  # 替换 requests
+import aiohttp  # 异步请求库
 import os
 import asyncio
 import logging
@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 异步数据工具函数 (基于 aiohttp) ---
+# --- 1. 异步数据工具函数 ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
     """安全获取 JSON (异步)"""
@@ -49,7 +49,6 @@ async def get_json_safely(session: aiohttp.ClientSession, url: str):
             try:
                 data = await response.json()
             except Exception:
-                # 处理非 JSON 响应或解析错误
                 logger.error(f"Failed to parse JSON from {url}")
                 return None
 
@@ -204,7 +203,6 @@ class ValuationModel:
         """异步获取所有 FMP 数据 (非阻塞并发)"""
         logger.info(f"--- Starting Analysis for {self.ticker} ---")
         
-        # 并发任务定义
         task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
         
@@ -220,19 +218,16 @@ class ValuationModel:
             "estimates": get_estimates_data(session, self.ticker)
         }
         
-        # 执行并发请求
         profile_data, treasury_data, *generic_results = await asyncio.gather(
             task_profile, 
             task_treasury, 
             *tasks_generic.values()
         )
         
-        # 组装数据
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # 解包列表数据
         for k in ["quote", "metrics", "ratios", "bs", "vix", "growth"]:
             if isinstance(self.data[k], list) and len(self.data[k]) > 0:
                 self.data[k] = self.data[k][0]
@@ -265,7 +260,7 @@ class ValuationModel:
             logger.error("🛑 Critical: Profile data missing, aborting analysis.")
             return None
 
-        # === 1. 基础数据提取 ===
+        # === 1. 基础数据 ===
         price = self.extract(q, "price", "Quote Price", default=p.get("price"))
         price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
         sector = self.extract(p, "sector", "Sector", "Unknown")
@@ -293,7 +288,6 @@ class ValuationModel:
 
         # 盈利检查
         eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
-        
         latest_eps = 0
         if isinstance(earnings_raw, list) and len(earnings_raw) > 0:
             sorted_earnings_for_check = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
@@ -527,6 +521,7 @@ class ValuationModel:
                 self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
         
         if not is_value_trap:
+            # PEG Log
             peg_display = format_num(peg_used) if peg_used is not None else "N/A"
             peg_status = "N/A"
             peg_comment = ""
@@ -581,10 +576,12 @@ class ValuationModel:
             else:
                  self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。预期业绩在下滑，注意风险。")
 
+            # Meme
             if is_faith_mode:
                 if 50 <= meme_pct < 60:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
-                    meme_strategy = "价格波动性可能增加，交易决策可以结合市场动量指标。"
+                    # 修改点1：Meme 策略优化
+                    meme_strategy = "当前股价受资金情绪主导，波动加剧。建议采取右侧顺势交易策略，并严格设置止损，避免盲目左侧博弈。"
                 elif 60 <= meme_pct < 70:
                     meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪高度活跃，体现出显著的**资金共识**和高流动性。"
                     meme_strategy = "较高的关注度和交易量反映了市场的积极情绪，但应注意伴随的高波动性。"
@@ -602,6 +599,7 @@ class ValuationModel:
                 if "昂贵" in lt_status: lt_status = "高溢价 (资金动量)"
                 if self.strategy == "数据不足": self.strategy = meme_strategy
 
+            # FCF Logic
             if fcf_yield_used is not None:
                 fcf_str = self.fcf_yield_display
                 is_high_quality_growth = (
@@ -620,7 +618,8 @@ class ValuationModel:
                     if adj_fcf_yield > 0.04 and not is_faith_mode:
                         lt_status = "便宜"
                         self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。这表明当前资本开支主要用于**增长性扩张**，剔除此因素后，公司核心造血能力强劲。")
-                        if self.strategy == "数据不足": self.strategy = "当前价格具备较好的安全边际，存在价值投资的可能。"
+                        # 修改点3：价值投资策略优化
+                        if self.strategy == "数据不足": self.strategy = "当前估值处于历史低位，价格已充分计入悲观预期，**风险收益比（盈亏比）极佳**。适合作为防御性底仓，耐心等待估值修复。"
                     elif fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005):
                         if roic and roic > 0.15:
                             self.logs.append(f"[价值修正] Adj FCF Yield ({fcf_str}) 高于 原始 FCF ({format_percent(fcf_yield_api)})。结合极高的 **ROIC ({format_percent(roic)})**，说明巨额资本开支正高效转化为增长，高强度的扩张投入掩盖了其真实的现金流产生能力。")
@@ -637,7 +636,8 @@ class ValuationModel:
                 elif is_hard_tech_growth and use_ps_valuation:
                     lt_status = "观察/成长"
                     if self.strategy == "数据不足" or "风险" in self.strategy:
-                        self.strategy = "当前处于以投入换增长的阶段。重点关注营收增速的持续性以及毛利率的边际改善。"
+                        # 修改点2：硬科技策略优化
+                        self.strategy = "当前处于‘高投入换高增长’的扩张期。核心逻辑在于**营收能否持续高增**以及**毛利率能否拐头向上**。建议紧密跟踪季度财报，一旦增速放缓或技术壁垒被证伪，需果断离场。"
 
                 if not use_ps_valuation and (not is_adj_fcf_successful or (is_adj_fcf_successful and lt_status != "便宜")):
                     fcf_threshold = 0.01 if (roic and roic > 0.20) else 0.02
