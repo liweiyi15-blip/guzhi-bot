@@ -115,8 +115,9 @@ def get_fmp_data(endpoint, ticker, params=""):
     return data
 
 def get_estimates_data(ticker):
-    """获取分析师预期数据 (年度)"""
-    url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&apikey={FMP_API_KEY}&limit=30&period=annual"
+    """获取分析师预期数据 (年度) - 严格修正版 URL"""
+    # 按照用户要求：period=annual, limit=10
+    url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
     data = get_json_safely(url)
     if data:
         logger.info(f"✅ [API] Estimates fetched: {len(data)} years.")
@@ -304,38 +305,37 @@ class ValuationModel:
         ni_growth = self.extract(m, "netIncomeGrowthTTM", "Net Income Growth TTM")
         rev_growth = self.extract(r, "revenueGrowthTTM", "Revenue Growth TTM")
 
-        # --- 🚀 Forward PEG Calculation (Dynamic Range) ---
+        # --- 🚀 Forward PEG Calculation (Smart Intelligent Range) ---
         forward_peg = None
         fwd_pe = None
         fwd_growth = None
         
         if estimates and len(estimates) > 0 and price:
             try:
-                # 1. Sort estimates by date ascending (Older -> Newer)
+                # 1. 智能排序 (确保按时间升序: 旧 -> 新)
                 estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
                 
-                # Log Range to confirm data
+                # Log Raw Range
                 start_date_raw = estimates[0].get("date")
                 end_date_raw = estimates[-1].get("date")
                 logger.info(f"📊 [Estimates] Raw data range: {start_date_raw} to {end_date_raw}")
 
-                # 2. Filter for FUTURE estimates only
+                # 2. 智能筛选未来 (Future Only)
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 future_estimates = [e for e in estimates if e.get("date", "") > today_str]
                 
-                # 3. Dynamic Selection
+                # 3. 智能选择最近的两个未来财年 (FY1, FY2)
                 if len(future_estimates) >= 2:
-                    # Take the nearest future year (FY1) and the one after (FY2)
-                    fy1 = future_estimates[0] 
-                    fy2 = future_estimates[1]
+                    fy1 = future_estimates[0] # 离现在最近的未来财年
+                    fy2 = future_estimates[1] # 紧接着的下一年
                     
                     date_fy1 = fy1.get("date")
                     date_fy2 = fy2.get("date")
                     eps_fy1 = fy1.get("epsAvg")
                     eps_fy2 = fy2.get("epsAvg")
                     
-                    logger.info(f"🔹 [Target] Selected FY1: {date_fy1} (EPS Est: {eps_fy1})")
-                    logger.info(f"🔹 [Target] Selected FY2: {date_fy2} (EPS Est: {eps_fy2})")
+                    logger.info(f"🔹 [Target] Selected FY1: {date_fy1} | EPS Est: {eps_fy1}")
+                    logger.info(f"🔹 [Target] Selected FY2: {date_fy2} | EPS Est: {eps_fy2}")
                     
                     if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
                         # Calc Forward PE based on FY1
@@ -344,8 +344,8 @@ class ValuationModel:
                         # Calc Growth Rate (FY1 -> FY2)
                         fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
                         
-                        logger.info(f"📐 [Calc] Price: {price:.2f} | FY1 EPS: {eps_fy1} | FY2 EPS: {eps_fy2}")
-                        logger.info(f"📐 [Calc] Implied Forward Growth: {fwd_growth:.2%}")
+                        logger.info(f"📐 [Calc] Forward PE (Price {price:.2f} / FY1 EPS {eps_fy1}): {fwd_pe:.2f}x")
+                        logger.info(f"📐 [Calc] Forward Growth (({eps_fy2} - {eps_fy1}) / {eps_fy1}): {fwd_growth:.2%}")
                         
                         if fwd_growth > 0:
                             forward_peg = fwd_pe / (fwd_growth * 100)
