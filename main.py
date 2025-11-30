@@ -1,7 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import aiohttp  # 异步请求库
+import aiohttp
 import os
 import asyncio
 import logging
@@ -32,67 +32,50 @@ HARD_TECH_KEYWORDS = ["semiconductor", "artificial intelligence", "software", "a
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%H:%M:%S' # 精简时间格式
 )
 logger = logging.getLogger("ValuationBot")
 
 # --- 1. 异步数据工具函数 ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
-    """安全获取 JSON (异步)"""
     try:
         async with session.get(url, timeout=10) as response:
             if response.status != 200:
                 logger.warning(f"API Status {response.status} for {url}")
                 return None
-            
             try:
                 data = await response.json()
             except Exception:
-                logger.error(f"Failed to parse JSON from {url}")
                 return None
-
             if isinstance(data, dict) and "Error Message" in data:
-                logger.warning(f"API Error for {url}: {data['Error Message']}")
                 return None
-                
             return data
-    except Exception as e:
-        logger.error(f"Request failed for {url}: {e}")
+    except Exception:
         return None
 
 async def get_treasury_rates(session: aiohttp.ClientSession):
-    """获取最新的国债收益率 (异步)"""
     today = datetime.now()
     start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
-    
     url = f"{BASE_URL}/treasury-rates?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
-    
     data = await get_json_safely(session, url)
     if data and isinstance(data, list) and len(data) > 0:
-        logger.info(f"✅ [API] Treasury Data fetched: {len(data)} records.")
         return data[0]
-    
     return None
 
 async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str):
-    """智能获取公司 Profile (异步)"""
+    # Profile
     url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
-    logger.info(f"📡 Trying Profile Endpoint: {ticker}")
     data = await get_json_safely(session, url_profile)
-    
     if data and isinstance(data, list) and len(data) > 0:
-        logger.info(f"✅ [API] Profile Data fetched for {ticker}.")
         return data[0]
     
-    logger.info(f"⚠️ Profile failed. Switching to Screener for {ticker}")
+    # Screener Fallback
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
-    
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
         item = data_scr[0]
-        logger.info(f"✅ [API] Profile fetched via Screener for {ticker}.")
         return {
             "symbol": item.get("symbol"),
             "price": item.get("price"),
@@ -107,33 +90,18 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
     return None
 
 async def get_fmp_data(session: aiohttp.ClientSession, endpoint: str, ticker: str, params: str = ""):
-    """通用接口获取函数 (异步)"""
     url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
-    if params:
-        url += f"&{params}"
-        
-    data = await get_json_safely(session, url)
-    if data:
-        count = len(data) if isinstance(data, list) else (1 if data else 0)
-        logger.info(f"✅ [API] {endpoint} fetched: {count} items.")
-    else:
-        logger.warning(f"⚠️ [API] {endpoint} returned None/Empty.")
-    return data
+    if params: url += f"&{params}"
+    return await get_json_safely(session, url)
 
 async def get_estimates_data(session: aiohttp.ClientSession, ticker: str):
-    """获取分析师预期数据 (年度) - 异步"""
     url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
     data = await get_json_safely(session, url)
-    if data:
-        logger.info(f"✅ [API] Estimates fetched: {len(data)} years.")
     return data if data else []
 
 async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
-    """获取历史财报预期与实际数据 (异步)"""
     url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
     data = await get_json_safely(session, url)
-    if data:
-        logger.info(f"✅ [API] Earnings fetched: {len(data)} quarters (Raw).")
     return data if data else []
 
 def format_percent(num):
@@ -148,7 +116,6 @@ def format_market_cap(num):
     if num >= 1e9: return f"${num/1e9:.2f}B"
     return f"${num/1e6:.2f}M"
 
-# --- 2. 行业基准 ---
 SECTOR_EBITDA_MEDIAN = {
     "Technology": 32.0, "Consumer Electronics": 25.0, "Communication Services": 20.0,
     "Healthcare": 18.0, "Financial Services": 12.0, "Energy": 10.0,
@@ -160,8 +127,6 @@ def get_sector_benchmark(sector):
     for key in SECTOR_EBITDA_MEDIAN:
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
-
-# --- 3. 估值判断模型 ---
 
 class ValuationModel:
     def __init__(self, ticker):
@@ -177,25 +142,15 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
 
-    def extract(self, source, key, desc, default=None, required=True):
+    # --- 修改版：默认静音，只负责提取 ---
+    def extract(self, source, key, default=None):
         val = source.get(key)
         if val is None:
-            if default is not None:
-                logger.info(f"ℹ️ [Info] {desc} ({key}) is None. Using Default: {default}")
-                return default
-            elif not required:
-                logger.info(f"🔹 [Optional] {desc} ({key}) is None. (Skipping)")
-                return None
-            else:
-                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
-                return None
-        else:
-            logger.info(f"✅ [Data] {desc}: {val}")
-            return val
+            return default
+        return val
 
     async def fetch_data(self, session: aiohttp.ClientSession):
-        """异步获取所有 FMP 数据 (非阻塞并发)"""
-        logger.info(f"--- Starting Analysis for {self.ticker} ---")
+        logger.info(f"--- 🏁 Analysis Start: {self.ticker} ---")
         
         task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
@@ -222,21 +177,33 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        for k in ["quote", "metrics", "ratios", "bs", "vix", "growth"]:
-            if isinstance(self.data[k], list) and len(self.data[k]) > 0:
-                self.data[k] = self.data[k][0]
-            elif isinstance(self.data[k], list) and len(self.data[k]) == 0:
-                if k != "growth":
-                    logger.warning(f"⚠️ [Structure] {k} list is empty.")
-                self.data[k] = {} 
-            elif self.data[k] is None:
+        # 1. 汇总 API 状态日志 (一行显示)
+        success_keys = []
+        missing_keys = []
+        
+        if profile_data: success_keys.append("Profile")
+        else: missing_keys.append("Profile")
+        
+        for k in tasks_generic.keys():
+            # 解包列表
+            raw = self.data[k]
+            if isinstance(raw, list) and len(raw) > 0:
+                self.data[k] = raw[0]
+                success_keys.append(k)
+            elif isinstance(raw, list) and len(raw) == 0:
                 self.data[k] = {}
+                if k != "growth": missing_keys.append(k) # growth 可选
+            elif raw is None:
+                self.data[k] = {}
+                missing_keys.append(k)
+            else:
+                success_keys.append(k) # 字典类型直接算成功
 
+        logger.info(f"📡 [API Status] Success: {len(success_keys)} | Missing: {missing_keys}")
         return self.data["profile"] is not None
 
     def analyze(self):
         try:
-            logger.info("--- 🚀 Starting Calculation Logic ---")
             p = self.data.get("profile", {}) or {}
             q = self.data.get("quote", {}) or {}
             m = self.data.get("metrics", {}) or {} 
@@ -251,31 +218,35 @@ class ValuationModel:
             
             if not p: return None
 
-            # === 1. 基础数据 ===
-            price = self.extract(q, "price", "Quote Price", default=p.get("price"))
-            price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
-            sector = self.extract(p, "sector", "Sector", "Unknown")
-            industry = self.extract(p, "industry", "Industry", "Unknown")
-            beta = self.extract(p, "beta", "Beta", default=1.0)
-            m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
+            # === 1. 基础数据提取 ===
+            price = self.extract(q, "price", default=p.get("price"))
+            price_200ma = self.extract(q, "priceAvg200")
+            sector = self.extract(p, "sector", "Unknown")
+            industry = self.extract(p, "industry", "Unknown")
+            beta = self.extract(p, "beta", default=1.0)
+            m_cap = self.extract(q, "marketCap", default=p.get("mktCap"))
             
             # === 2. 财务指标 ===
-            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA (Ratio)", required=False)
+            ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM")
             if ev_ebitda is None:
-                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA (Metric)", required=False)
+                ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM")
             
-            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield TTM", required=False)
+            fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM")
             self.fcf_yield_api = fcf_yield_api 
             
-            roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC TTM", required=False)
-            net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin TTM", required=False)
-            ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S Ratio TTM", required=False)
+            roic = self.extract(m, "returnOnInvestedCapitalTTM")
+            net_margin = self.extract(r, "netProfitMarginTTM")
+            ps_ratio = self.extract(r, "priceToSalesRatioTTM")
             
-            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM", required=False)
-            pe_ttm = self.extract(r, "priceToEarningsRatioTTM", "PE TTM", required=False)
+            peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM")
+            pe_ttm = self.extract(r, "priceToEarningsRatioTTM")
             
-            ni_growth = self.extract(g, "netIncomeGrowth", "Net Income Growth (Annual)", required=False)
-            rev_growth = self.extract(g, "revenueGrowth", "Revenue Growth (Annual)", required=False)
+            ni_growth = self.extract(g, "netIncomeGrowth")
+            rev_growth = self.extract(g, "revenueGrowth")
+
+            # === 日志快照：基础数据 ===
+            logger.info(f"📊 [Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
+            logger.info(f"📊 [Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
 
             # 盈利检查
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
@@ -287,11 +258,10 @@ class ValuationModel:
                     latest_eps = val if val is not None else 0
 
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
-            logger.info(f"🔎 [Profit Check] Is Profitable Strict: {is_profitable_strict}")
-
-            # === 3. 资产负债 ===
-            cash = self.extract(bs, "cashAndCashEquivalents", "Cash", required=False, default=0)
-            debt = self.extract(bs, "totalDebt", "Total Debt", required=False, default=0)
+            
+            # 资产负债
+            cash = self.extract(bs, "cashAndCashEquivalents", default=0)
+            debt = self.extract(bs, "totalDebt", default=0)
             is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
 
             # === 4. Forward PEG 计算 ===
@@ -307,10 +277,8 @@ class ValuationModel:
                     future_estimates = [e for e in estimates if e.get("date", "") > today_str]
                     
                     if len(future_estimates) >= 2:
-                        fy1 = future_estimates[0] 
-                        fy2 = future_estimates[1] 
-                        eps_fy1 = fy1.get("epsAvg")
-                        eps_fy2 = fy2.get("epsAvg")
+                        fy1 = future_estimates[0]; fy2 = future_estimates[1] 
+                        eps_fy1 = fy1.get("epsAvg"); eps_fy2 = fy2.get("epsAvg")
                         eps_fy1_val = eps_fy1 
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
@@ -318,12 +286,14 @@ class ValuationModel:
                             fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
-                                logger.info(f"✅ [Result] Forward PEG: {forward_peg:.2f}")
-                except Exception as e:
-                    logger.error(f"❌ Error calculating Forward PEG: {e}")
+                except Exception:
+                    pass
 
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
+            
+            # === 日志快照：PEG 决策 ===
+            logger.info(f"⚖️ [PEG Decision] Forward: {format_num(forward_peg)} (FY1={eps_fy1_val}, G={format_percent(fwd_growth)}) | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
 
             # Growth Desc
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
@@ -341,44 +311,41 @@ class ValuationModel:
                 ttm_dep_amort = 0
                 quarter_count = 0
                 for i, q_data in enumerate(cf_list): 
-                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities", f"CF Q{i} CFO", required=False)
-                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization", f"CF Q{i} D&A", required=False)
+                    cfo_q = self.extract(q_data, "netCashProvidedByOperatingActivities")
+                    dep_amort_q = self.extract(q_data, "depreciationAndAmortization")
                     if cfo_q is not None and dep_amort_q is not None:
                         ttm_cfo += cfo_q
                         ttm_dep_amort += dep_amort_q
                         quarter_count += 1
-                    else:
-                        break 
-
+                    else: break 
                 if ttm_cfo != 0 and quarter_count >= 4:
                     MAINTENANCE_CAPEX_RATIO = 0.5 
                     maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
                     adj_fcf = ttm_cfo - maintenance_capex
                     adj_fcf_yield = adj_fcf / m_cap
                     self.fcf_yield_display = format_percent(adj_fcf_yield) 
-                
+            
             fcf_yield_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
             if fcf_yield_used == fcf_yield_api:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
-            # === 6. 赛道识别 ===
+            # === 日志快照：现金流 ===
+            logger.info(f"💰 [Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
+
+            # --- 赛道识别 ---
             is_blue_ocean = False       
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
             for kw in BLUE_OCEAN_KEYWORDS:
-                if kw in sec_str or kw in ind_str:
-                    is_blue_ocean = True
-                    break
+                if kw in sec_str or kw in ind_str: is_blue_ocean = True; break
             for kw in HARD_TECH_KEYWORDS:
-                if kw in sec_str or kw in ind_str:
-                    is_hard_tech_growth = True
-                    break
+                if kw in sec_str or kw in ind_str: is_hard_tech_growth = True; break
             if self.ticker in HARD_TECH_TICKERS:
                 if not is_blue_ocean: is_hard_tech_growth = True
 
-            # === 7. 宏观利率 ===
-            yield_10y = self.extract(t, 'year10', "10Y Treasury Yield", required=False)
+            # --- 宏观利率 ---
+            yield_10y = self.extract(t, 'year10')
             macro_discount_factor = 1.0 
             macro_status_log = None
             is_growth_asset = is_blue_ocean or is_hard_tech_growth or (max_growth > 0.15) or (pe_ttm and pe_ttm > 30)
@@ -391,18 +358,18 @@ class ValuationModel:
                     macro_discount_factor = 1.5
                     macro_status_log = f"[宏观红利] 10Y美债收益率 {yield_10y}% (<3.8%)。流动性充裕，成长股享受估值扩张，合理估值上浮 50%。"
             
-            if macro_status_log:
-                self.logs.append(macro_status_log)
+            if macro_status_log: self.logs.append(macro_status_log)
 
-            # === 8. VIX & Meme ===
-            vix = self.extract(vix_data, "price", "VIX Price", default=20)
+            # --- VIX ---
+            vix = self.extract(vix_data, "price", default=20)
             if price and beta and vix:
                 monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
                 self.risk_var = f"-{monthly_risk_pct:.1f}%"
             
+            # --- Meme ---
             meme_score = 0
-            vol_today = self.extract(q, "volume", "Volume Today", required=False)
-            vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
+            vol_today = self.extract(q, "volume")
+            vol_avg = self.extract(q, "avgVolume")
             if price and price_200ma:
                 if price > price_200ma * 1.4: meme_score += 2
                 elif price > price_200ma * 1.15: meme_score += 1
@@ -455,7 +422,6 @@ class ValuationModel:
             if net_margin and net_margin > 0.20:
                 self.logs.append(f"[盈利质量] 净利率 ({format_percent(net_margin)}) 极高，展现出强大的产品定价权或成本控制力。")
 
-            # --- 巨头判断 ---
             is_giant = m_cap is not None and m_cap > 200_000_000_000
 
             if not is_distressed:
@@ -541,6 +507,7 @@ class ValuationModel:
                 if is_faith_mode:
                     meme_log = ""
                     meme_strategy_text = "价格波动性可能增加，交易决策可以结合市场动量指标。"
+
                     if 50 <= meme_pct < 60:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
                     elif 60 <= meme_pct < 70:
@@ -549,8 +516,10 @@ class ValuationModel:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，公司获得大量**关注溢价**，价格驱动力强劲。"
                     elif 80 <= meme_pct < 90:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪已进入非理性繁荣区间，价格体现出**极致的资金动能**。"
+                        meme_strategy_text = "此时价格驱动因素主要为情绪和资金流，应极为谨慎评估其风险收益比。"
                     elif meme_pct >= 90:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪处于顶峰，反映出**极强的短期向上动量**。"
+                        meme_strategy_text = "市场波动和回调风险已处于历史高位，对于中长期投资者而言，保持警惕性至关重要。"
                     
                     if is_giant and meme_pct < 80:
                         if meme_log: self.logs.insert(0, meme_log)
@@ -570,7 +539,6 @@ class ValuationModel:
                         if fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005): 
                             self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                             if adj_fcf_yield > 0.04: lt_status = "便宜"
-                    
                     elif is_adj_fcf_successful and not use_ps_valuation:
                         if adj_fcf_yield > 0.04 and not is_faith_mode:
                             lt_status = "便宜"
@@ -611,7 +579,7 @@ class ValuationModel:
                                 if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
                                 else:
-                                    # 巨头策略优化
+                                    # 巨头策略 (AMZN/GOOG)
                                     if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
                                         if ev_ebitda is not None and ev_ebitda < 25:
                                             self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
@@ -634,13 +602,17 @@ class ValuationModel:
                 if isinstance(earnings_raw, list):
                     sorted_earnings = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
                     recent_earnings = sorted_earnings[:12]
-                    logger.info(f"🔄 Processing Recent Earnings List ({len(recent_earnings)} items from top)...")
+                    # 日志快照：财报 (只打印一条汇总)
+                    if recent_earnings:
+                        latest_q = recent_earnings[0]
+                        logger.info(f"🔄 [Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')} (Est: {latest_q.get('epsEstimated')})")
+                    
                     for e in recent_earnings:
                         date = e.get("date")
                         if date and date <= today_str:
-                            rev = self.extract(e, "revenueActual", f"Earn {date} Rev", default=e.get("revenue"))
-                            eps = self.extract(e, "epsActual", f"Earn {date} EPS")
-                            est = self.extract(e, "epsEstimated", f"Earn {date} Est")
+                            rev = self.extract(e, "revenueActual", default=e.get("revenue"))
+                            eps = self.extract(e, "epsActual")
+                            est = self.extract(e, "epsEstimated")
                             if rev is not None and eps is not None:
                                 valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
                 
@@ -699,9 +671,6 @@ class ValuationModel:
             logger.error(f"Analyze Error: {e}")
             return None
 
-# -------------------------------------------------------------------
-# AnalysisBot 类必须在 bot 实例化之前定义
-# -------------------------------------------------------------------
 class AnalysisBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -720,9 +689,6 @@ class AnalysisBot(commands.Bot):
             await self.session.close()
         await super().close()
 
-# -------------------------------------------------------------------
-# 实例化 Bot
-# -------------------------------------------------------------------
 bot = AnalysisBot()
 
 @bot.tree.command(name="privacy", description="切换隐私查询模式 (开启后分析结果仅自己可见)")
