@@ -32,7 +32,7 @@ HARD_TECH_KEYWORDS = ["semiconductor", "artificial intelligence", "software", "a
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S' # 精简时间格式
+    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("ValuationBot")
 
@@ -65,13 +65,11 @@ async def get_treasury_rates(session: aiohttp.ClientSession):
     return None
 
 async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str):
-    # Profile
     url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
     data = await get_json_safely(session, url_profile)
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
     
-    # Screener Fallback
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
@@ -142,7 +140,6 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
 
-    # --- 修改版：默认静音，只负责提取 ---
     def extract(self, source, key, default=None):
         val = source.get(key)
         if val is None:
@@ -177,7 +174,9 @@ class ValuationModel:
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # 1. 汇总 API 状态日志 (一行显示)
+        # 关键修复：区分单条数据和列表数据
+        list_keys = ["earnings", "estimates", "cf"] # 这些必须保持列表结构
+        
         success_keys = []
         missing_keys = []
         
@@ -185,19 +184,29 @@ class ValuationModel:
         else: missing_keys.append("Profile")
         
         for k in tasks_generic.keys():
-            # 解包列表
             raw = self.data[k]
-            if isinstance(raw, list) and len(raw) > 0:
-                self.data[k] = raw[0]
-                success_keys.append(k)
-            elif isinstance(raw, list) and len(raw) == 0:
-                self.data[k] = {}
-                if k != "growth": missing_keys.append(k) # growth 可选
-            elif raw is None:
-                self.data[k] = {}
-                missing_keys.append(k)
+            
+            if k in list_keys:
+                # 列表类型：保持原样
+                if isinstance(raw, list) and len(raw) > 0:
+                    self.data[k] = raw
+                    success_keys.append(k)
+                else:
+                    self.data[k] = []
+                    missing_keys.append(k)
             else:
-                success_keys.append(k) # 字典类型直接算成功
+                # 单条类型：解包
+                if isinstance(raw, list) and len(raw) > 0:
+                    self.data[k] = raw[0]
+                    success_keys.append(k)
+                elif isinstance(raw, list) and len(raw) == 0:
+                    self.data[k] = {}
+                    if k != "growth": missing_keys.append(k)
+                elif raw is None:
+                    self.data[k] = {}
+                    missing_keys.append(k)
+                else:
+                    success_keys.append(k)
 
         logger.info(f"📡 [API Status] Success: {len(success_keys)} | Missing: {missing_keys}")
         return self.data["profile"] is not None
@@ -221,8 +230,8 @@ class ValuationModel:
             # === 1. 基础数据提取 ===
             price = self.extract(q, "price", default=p.get("price"))
             price_200ma = self.extract(q, "priceAvg200")
-            sector = self.extract(p, "sector", "Unknown")
-            industry = self.extract(p, "industry", "Unknown")
+            sector = self.extract(p, "sector", default="Unknown")
+            industry = self.extract(p, "industry", default="Unknown")
             beta = self.extract(p, "beta", default=1.0)
             m_cap = self.extract(q, "marketCap", default=p.get("mktCap"))
             
@@ -292,8 +301,7 @@ class ValuationModel:
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
             
-            # === 日志快照：PEG 决策 ===
-            logger.info(f"⚖️ [PEG Decision] Forward: {format_num(forward_peg)} (FY1={eps_fy1_val}, G={format_percent(fwd_growth)}) | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
+            logger.info(f"⚖️ [PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
 
             # Growth Desc
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
@@ -329,7 +337,6 @@ class ValuationModel:
             if fcf_yield_used == fcf_yield_api:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
-            # === 日志快照：现金流 ===
             logger.info(f"💰 [Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
 
             # --- 赛道识别 ---
@@ -474,7 +481,6 @@ class ValuationModel:
                     self.strategy = "趋势与基本面双弱，存在‘接飞刀’的风险"
             
             if not is_value_trap:
-                # PEG Log
                 peg_display = format_num(peg_used) if peg_used is not None else "N/A"
                 peg_status = "N/A"
                 peg_comment = ""
@@ -532,13 +538,18 @@ class ValuationModel:
                 # FCF Logic
                 if fcf_yield_used is not None:
                     fcf_str = self.fcf_yield_display
-                    is_high_quality_growth = (("高速" in growth_desc or "超高速" in growth_desc or ("稳健" in growth_desc and roic is not None and roic > 0.20)) and roic is not None and roic > 0.15)
+                    is_high_quality_growth = (
+                        ("高速" in growth_desc or "超高速" in growth_desc or 
+                        ("稳健" in growth_desc and roic is not None and roic > 0.20))
+                        and roic is not None and roic > 0.15
+                    )
                     is_adj_fcf_successful = adj_fcf_yield is not None
                     
                     if is_adj_fcf_successful and use_ps_valuation:
                         if fcf_yield_api is not None and adj_fcf_yield > (fcf_yield_api + 0.0005): 
                             self.logs.append(f"[资本开支] Adj FCF Yield ({fcf_str}) 优于 原始 FCF ({format_percent(fcf_yield_api)})，反映出显著的**前置性资本投入**特征。")
                             if adj_fcf_yield > 0.04: lt_status = "便宜"
+                    
                     elif is_adj_fcf_successful and not use_ps_valuation:
                         if adj_fcf_yield > 0.04 and not is_faith_mode:
                             lt_status = "便宜"
@@ -556,6 +567,7 @@ class ValuationModel:
                             self.logs.append(f"[护城河] 处于竞争不充分的蓝海市场，行业壁垒极高，稀缺性溢价合理。")
                         if self.strategy == "数据不足" or "风险" in self.strategy:
                             self.strategy = "估值锚点在于远期市场垄断地位。短期受资金情绪影响大，适合在技术回调时分批布局，非信徒需谨慎。"
+                    
                     elif is_hard_tech_growth and use_ps_valuation:
                         lt_status = "观察/成长"
                         if self.strategy == "数据不足" or "风险" in self.strategy:
@@ -579,7 +591,7 @@ class ValuationModel:
                                 if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
                                 else:
-                                    # 巨头策略 (AMZN/GOOG)
+                                    # 巨头策略优化
                                     if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
                                         if ev_ebitda is not None and ev_ebitda < 25:
                                             self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
@@ -602,7 +614,6 @@ class ValuationModel:
                 if isinstance(earnings_raw, list):
                     sorted_earnings = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
                     recent_earnings = sorted_earnings[:12]
-                    # 日志快照：财报 (只打印一条汇总)
                     if recent_earnings:
                         latest_q = recent_earnings[0]
                         logger.info(f"🔄 [Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')} (Est: {latest_q.get('epsEstimated')})")
