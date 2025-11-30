@@ -144,20 +144,17 @@ class ValuationModel:
         val = source.get(key)
         if val is None:
             if default is not None:
-                # logger.info(f"ℹ️ [Info] {desc} ({key}) is None. Using Default: {default}")
                 return default
             elif not required:
-                # logger.info(f"🔹 [Optional] {desc} ({key}) is None. (Skipping)")
                 return None
             else:
-                logger.warning(f"⚠️ [Missing] {desc} ({key}) is None!")
+                logger.warning(f"[Missing] {desc} ({key}) is None!")
                 return None
         else:
-            # logger.info(f"✅ [Data] {desc}: {val}")
             return val
 
     async def fetch_data(self, session: aiohttp.ClientSession):
-        logger.info(f"--- 🏁 Analysis Start: {self.ticker} ---")
+        logger.info(f"--- Analysis Start: {self.ticker} ---")
         task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
         tasks_generic = {
@@ -197,7 +194,7 @@ class ValuationModel:
                 else:
                     success_keys.append(k)
 
-        logger.info(f"📡 [API Status] Success: {len(success_keys)} endpoints.")
+        logger.info(f"[API Status] Success: {len(success_keys)} endpoints.")
         return self.data["profile"] is not None
 
     def analyze(self):
@@ -251,7 +248,7 @@ class ValuationModel:
                     val = sorted_earnings_for_check[0].get("epsActual")
                     latest_eps = val if val is not None else 0
                     latest_q = sorted_earnings_for_check[0]
-                    logger.info(f"🔄 [Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')}")
+                    logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {latest_q.get('epsActual')}")
 
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
             
@@ -261,8 +258,8 @@ class ValuationModel:
             is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
 
             # 日志快照
-            logger.info(f"📊 [Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
-            logger.info(f"📊 [Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
+            logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
+            logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
 
             # === 4. Forward PEG 计算 ===
             forward_peg = None
@@ -292,7 +289,7 @@ class ValuationModel:
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
             
-            logger.info(f"⚖️ [PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
+            logger.info(f"[PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
 
             # Growth Desc
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
@@ -328,10 +325,10 @@ class ValuationModel:
             if fcf_yield_used == fcf_yield_api:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
-            logger.info(f"💰 [Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
+            logger.info(f"[Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
 
             # --- 赛道识别 ---
-            is_blue_ocean = False       
+            is_blue_ocean = False        
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
@@ -501,12 +498,10 @@ class ValuationModel:
                         elif peg_used <= 1.5: peg_status = "合理"; peg_comment = "估值与增长匹配。"
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
                 elif peg_used is None:
-                    if not is_profitable_strict and (eps_fy1_val is None or eps_fy1_val <= 0):
-                         self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。公司尚未盈利。")
-                    else:
-                         self.logs.append(f"[成长锚点] PEG 数据缺失。")
+                     self.logs.append(f"[成长锚点] PEG 数据缺失。")
                 else:
-                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} (负值)。预期业绩在下滑，注意风险。")
+                    # 针对 NIO 等负PEG情况的修改
+                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display}。公司处于亏损或盈利不稳定阶段，PEG指标参考性较弱，建议更多关注营收增速与现金流状况。")
 
                 # Meme
                 if is_faith_mode:
@@ -587,7 +582,8 @@ class ValuationModel:
                                         if ev_ebitda is not None and ev_ebitda < 25:
                                             self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
                                         else:
-                                            self.strategy = "拥有强大的造血能力，但当前估值包含了一定溢价。属于‘优质但不便宜’的核心资产，适合长期持有以消化估值。"
+                                            # AMZN/GOOG 策略调整
+                                            self.strategy = "公司展现出卓越的自由现金流创造能力与行业统治力。当前估值虽有溢价，但反映了市场对其确定性的认可。策略上视其为核心底仓配置，重点通过长期持有以通过业绩增长消化估值，而非博弈短期波动。"
                                     else:
                                         self.strategy = "行业地位稳固，护城河极深。当前估值与增长潜力匹配度高，属于典型的‘核心资产’。适合作为长期底仓，赚取业绩增长的钱。"
 
@@ -608,9 +604,11 @@ class ValuationModel:
                     for e in recent_earnings:
                         date = e.get("date")
                         if date and date <= today_str:
-                            rev = self.extract(e, "revenueActual", default=e.get("revenue"))
-                            eps = self.extract(e, "epsActual")
-                            est = self.extract(e, "epsEstimated")
+                            # 修复报错的核心代码
+                            rev = self.extract(e, "revenueActual", "Revenue", default=e.get("revenue"))
+                            eps = self.extract(e, "epsActual", "EPS")
+                            est = self.extract(e, "epsEstimated", "EPS Est")
+                            
                             if rev is not None and eps is not None:
                                 valid_earnings.append({"date": date, "rev": rev, "eps": eps, "est": est})
                 
@@ -696,7 +694,7 @@ async def privacy(interaction: discord.Interaction):
     new_state = not is_on
     PRIVACY_MODE[user_id] = new_state
     status = "已开启 (查询结果仅自己可见)" if new_state else "已关闭 (查询结果公开)"
-    await interaction.response.send_message(f"✅ 隐私模式切换成功。\n当前状态: **{status}**", ephemeral=True)
+    await interaction.response.send_message(f"[Info] 隐私模式切换成功。\n当前状态: **{status}**", ephemeral=True)
 
 async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
     is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
@@ -709,7 +707,7 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     
     if is_privacy_mode and success:
         public_embed = discord.Embed(
-            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n⚡正在分析“{ticker.upper()}”中...",
+            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n[Loading] 正在分析“{ticker.upper()}”中...",
             color=0x2b2d31
         )
         try:
@@ -718,12 +716,12 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
             logger.error(f"Failed to send public status message: {e}")
     
     if not success:
-        await interaction.followup.send(f"❌ 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
+        await interaction.followup.send(f"[Error] 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
         return
 
     data = model.analyze()
     if not data:
-        await interaction.followup.send(f"⚠️ 数据不足。", ephemeral=ephemeral_result)
+        await interaction.followup.send(f"[Warning] 数据不足。", ephemeral=ephemeral_result)
         return
 
     profit_label = "盈利" if data.get('is_profitable', False) else "亏损"
