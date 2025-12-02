@@ -721,7 +721,7 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     
     if is_privacy_mode and success:
         public_embed = discord.Embed(
-            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n[Loading] 正在分析“{ticker.upper()}”中...",
+            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n“{ticker.upper()}”分析报告已发送给用户✔️",
             color=0x2b2d31
         )
         try:
