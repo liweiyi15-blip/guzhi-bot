@@ -417,10 +417,11 @@ class ValuationModel:
                      st_status = "极其昂贵/失血"
                      self.logs.append(f"[预警] 自由现金流严重流失且无增长支撑。")
 
-            if is_cash_rich:
-                self.logs.append(f"[资产负债] 公司持有净现金 (现金>债务)，资产负债表健康，抗风险能力强。")
-            elif debt and cash and debt > cash * 5:
-                self.logs.append(f"[资产负债] 债务负担较重 (债务是现金的5倍以上)，需关注利息支出压力。")
+            # 隐藏资产负债因子分析 (By User Request)
+            # if is_cash_rich:
+            #     self.logs.append(f"[资产负债] 公司持有净现金 (现金>债务)，资产负债表健康，抗风险能力强。")
+            # elif debt and cash and debt > cash * 5:
+            #     self.logs.append(f"[资产负债] 债务负担较重 (债务是现金的5倍以上)，需关注利息支出压力。")
 
             if net_margin and net_margin > 0.20:
                 self.logs.append(f"[盈利质量] 净利率 ({format_percent(net_margin)}) 极高，展现出强大的产品定价权或成本控制力。")
@@ -466,9 +467,14 @@ class ValuationModel:
                         else:
                             st_status = "昂贵"
                             self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 远高于行业均值 ({sector_avg})，且缺乏增长支撑。")
+                            if self.strategy == "数据不足":
+                                self.strategy = "当前估值显著高于行业水平，且缺乏极致的PEG或高ROIC支撑。此时买入缺乏安全边际，风险收益比不高，建议等待回调或业绩进一步兑现。"
                     else:
                         st_status = "估值合理"
                         self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
+                        # 修复: 针对“估值合理”区间的策略真空
+                        if self.strategy == "数据不足":
+                            self.strategy = "当前估值处于合理区间，多空信号不明显。建议以持有观望为主，等待业绩驱动或更具吸引力的价格出现。"
             
             self.short_term_verdict = st_status
 
@@ -583,7 +589,7 @@ class ValuationModel:
                             if not has_value_fix_log:
                                 self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
                             if self.strategy == "数据不足" or "风险" in self.strategy:
-                                # 修复：增加 PEG 约束，避免高估值公司(如 GOOG PEG 5.39)被误判为黄金窗口
+                                # 修复：增加 PEG 约束，避免高估值公司被误判为黄金窗口
                                 is_peg_safe = peg_used is None or peg_used < 2.2 # 用户要求2.2
                                 if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
                                     self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
