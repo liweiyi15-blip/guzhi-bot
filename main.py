@@ -417,12 +417,6 @@ class ValuationModel:
                      st_status = "极其昂贵/失血"
                      self.logs.append(f"[预警] 自由现金流严重流失且无增长支撑。")
 
-            # 隐藏资产负债因子分析 (By User Request)
-            # if is_cash_rich:
-            #     self.logs.append(f"[资产负债] 公司持有净现金 (现金>债务)，资产负债表健康，抗风险能力强。")
-            # elif debt and cash and debt > cash * 5:
-            #     self.logs.append(f"[资产负债] 债务负担较重 (债务是现金的5倍以上)，需关注利息支出压力。")
-
             if net_margin and net_margin > 0.20:
                 self.logs.append(f"[盈利质量] 净利率 ({format_percent(net_margin)}) 极高，展现出强大的产品定价权或成本控制力。")
 
@@ -454,16 +448,28 @@ class ValuationModel:
                 elif ev_ebitda is not None:
                     ratio = ev_ebitda / sector_avg
                     adjusted_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
+                    
                     if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 1.5):
                         st_status = "便宜 (高成长)"
                         self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg_used)}) 极低，属于越涨越便宜。")
+                        # 修复：NFLX Short Term 策略真空
+                        if self.strategy == "数据不足":
+                            self.strategy = "PEG极低且具备高成长属性，市场低估了其增长爆发力，属于极具性价比的进攻型标的。"
+
                     elif adjusted_ratio < 0.7:
                         st_status = "便宜"
                         self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
+                        # 修复：低估值但非高成长的策略真空
+                        if self.strategy == "数据不足":
+                            self.strategy = "当前估值显著低于行业平均水平，具备安全边际。建议关注是否有基本面改善的催化剂以修复估值。"
+
                     elif adjusted_ratio > 1.3:
                         if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 2.0):
                             st_status = "合理溢价"
                             self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
+                            # 修复：合理溢价的策略真空
+                            if self.strategy == "数据不足":
+                                self.strategy = "高估值由高增长支撑，只要业绩增速维持，股价仍有上行空间，但需紧密跟踪财报。"
                         else:
                             st_status = "昂贵"
                             self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 远高于行业均值 ({sector_avg})，且缺乏增长支撑。")
@@ -472,7 +478,6 @@ class ValuationModel:
                     else:
                         st_status = "估值合理"
                         self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
-                        # 修复: 针对“估值合理”区间的策略真空
                         if self.strategy == "数据不足":
                             self.strategy = "当前估值处于合理区间，多空信号不明显。建议以持有观望为主，等待业绩驱动或更具吸引力的价格出现。"
             
@@ -578,29 +583,40 @@ class ValuationModel:
                         if fcf_yield_used < fcf_threshold and is_high_quality_growth and not is_faith_mode:
                             lt_status = "预期驱动/投资扩张"
                             self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
+                            # 修复：NFLX Long Term 策略真空
+                            if self.strategy == "数据不足":
+                                self.strategy = "基本面强劲，当前处于高投入换高增长阶段。投资逻辑应侧重于未来的业绩释放能力，而非当下的现金流回报。"
                         elif fcf_yield_used < fcf_threshold and not is_high_quality_growth and not is_faith_mode:
                             lt_status = "昂贵"
                             self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                             if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
                         
-                        elif roic and roic > 0.20 and (not is_faith_mode or (is_giant and meme_pct < 80)):
-                            lt_status = "优质/值得等待"
-                            has_value_fix_log = any("[价值修正]" in x for x in self.logs)
-                            if not has_value_fix_log:
-                                self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
-                            if self.strategy == "数据不足" or "风险" in self.strategy:
-                                # 修复：增加 PEG 约束，避免高估值公司被误判为黄金窗口
-                                is_peg_safe = peg_used is None or peg_used < 2.2 # 用户要求2.2
-                                if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
-                                    self.strategy = "【黄金配置窗口】极为罕见！公司拥有顶级资本效率(高ROIC)，却交易在行业估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
+                # 修复: 将 ROIC 逻辑从 FCF 的 elif 链条中解耦出来，改为独立 if
+                if roic and roic > 0.20 and (not is_faith_mode or (is_giant and meme_pct < 80)): 
+                    lt_status = "优质/值得等待"
+                    has_value_fix_log = any("[价值修正]" in x for x in self.logs)
+                    if not has_value_fix_log:
+                        self.logs.append(f"[辩证] ROIC ({format_percent(roic)}) 极高，属于'优质溢价'资产。")
+                    
+                    if self.strategy == "数据不足" or "风险" in self.strategy or "高投入" in self.strategy:
+                        is_peg_safe = peg_used is None or peg_used < 2.2 
+                        
+                        # 【逻辑升级】增加 FCF 门槛，区分“黄金窗口”与“优质扩张”
+                        is_cash_flow_safe = adj_fcf_yield is not None and adj_fcf_yield > 0.015
+
+                        if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
+                            if is_cash_flow_safe:
+                                self.strategy = "【黄金配置窗口】极为罕见！顶级资本效率(ROIC)叠加健康现金流，且处于估值折价区。属于‘好行业、好公司、好价格’的不可能三角，强烈建议关注。"
+                            else:
+                                self.strategy = "【优质扩张】公司资本效率(ROIC)极高且估值合理。虽然当前自由现金流较低（用于再投入），但由高ROIC支撑的扩张具备极高的复利效应，适合作为成长股配置。"
+                        else:
+                            if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
+                                if ev_ebitda is not None and ev_ebitda < 25:
+                                    self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
                                 else:
-                                    if is_giant and adj_fcf_yield and adj_fcf_yield > 0.025:
-                                        if ev_ebitda is not None and ev_ebitda < 25:
-                                            self.strategy = "EV/EBITDA 显示其估值处于合理偏低区间，且现金流强劲。属于‘价格公道的好公司’，具备长期配置价值。"
-                                        else:
-                                            self.strategy = "公司展现出卓越的自由现金流创造能力与行业统治力。当前估值虽有溢价，但反映了市场对其确定性的认可。策略上视其为核心底仓配置，重点通过长期持有以通过业绩增长消化估值，而非博弈短期波动。"
-                                    else:
-                                        self.strategy = "行业地位稳固，护城河极深。当前估值与增长潜力匹配度高，属于典型的‘核心资产’。适合作为长期底仓，赚取业绩增长的钱。"
+                                    self.strategy = "公司展现出卓越的自由现金流创造能力与行业统治力。当前估值虽有溢价，但反映了市场对其确定性的认可。策略上视其为核心底仓配置，重点通过长期持有以通过业绩增长消化估值，而非博弈短期波动。"
+                            else:
+                                self.strategy = "行业地位稳固，护城河极深。当前估值与增长潜力匹配度高，属于典型的‘核心资产’。适合作为长期底仓，赚取业绩增长的钱。"
 
                 if roic and roic > 0.15 and "昂贵" not in lt_status and not is_value_trap:
                     has_dialectic = any("[辩证]" in x or "[价值修正]" in x for x in self.logs)
