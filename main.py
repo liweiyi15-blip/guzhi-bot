@@ -177,6 +177,9 @@ class ValuationModel:
         self.long_term_verdict = "未知"
         self.risk_var = "N/A"  
         self.context_for_ai = "" 
+        # 【修复点：初始化缺失变量】
+        self.fcf_yield_display = "N/A"
+        self.fcf_yield_api = None
 
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
@@ -195,6 +198,7 @@ class ValuationModel:
         task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
         
+        # 【还原】URL 参数完全对照第一版代码
         tasks_generic = {
             "quote": get_fmp_data(session, "quote", self.ticker, ""),
             "metrics": get_fmp_data(session, "key-metrics-ttm", self.ticker, ""),
@@ -203,15 +207,15 @@ class ValuationModel:
             "bs": get_fmp_data(session, "balance-sheet-statement", self.ticker, "limit=1"),
             "cf": get_fmp_data(session, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
             "vix": get_fmp_data(session, "quote", "^VIX", ""),
-            "earnings": get_earnings_data(session, self.ticker),
-            "estimates": get_estimates_data(session, self.ticker)
+            "earnings": get_earnings_data(session, self.ticker), # 使用独立函数
+            "estimates": get_estimates_data(session, self.ticker) # 使用独立函数(limit=10)
         }
         profile_data, treasury_data, *generic_results = await asyncio.gather(task_profile, task_treasury, *tasks_generic.values())
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
         
-        # API Status Log
+        # 【还原】API 统计逻辑
         success_count = 0
         for k in tasks_generic.keys():
             raw = self.data[k]
@@ -239,6 +243,7 @@ class ValuationModel:
 
     def analyze(self):
         try:
+            # 数据解包
             p = self.data.get("profile", {}) or {}
             q = self.data.get("quote", {}) or {}
             m = self.data.get("metrics", {}) or {} 
@@ -269,7 +274,7 @@ class ValuationModel:
             if ev_ebitda is None: ev_ebitda = self.extract(m, "enterpriseValueOverEBITDATTM", "EV/EBITDA", required=False)
             
             fcf_yield_api = self.extract(m, "freeCashFlowYieldTTM", "FCF Yield", required=False)
-            self.fcf_yield_api = fcf_yield_api 
+            self.fcf_yield_api = fcf_yield_api # 保存API原始值
             
             roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC", required=False)
             net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin", required=False)
@@ -309,7 +314,6 @@ class ValuationModel:
             if beta and price and isinstance(vix_data, dict):
                 vix_val = vix_data.get("price")
                 if vix_val:
-                    # 【修复点：变量名错误】
                     var_95_pct = beta * (vix_val / 100.0) * math.sqrt(1/12) * 1.65
                     if beta > 1.5 or not is_profitable_strict:
                         var_95_pct *= 1.2
@@ -373,7 +377,6 @@ class ValuationModel:
             if estimates and len(estimates) > 0 and price:
                 try:
                     estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
-                    # 只看未来数据
                     future = [e for e in estimates if e.get("date", "") > today_str]
                     if len(future) >= 2:
                         fy1, fy2 = future[0], future[1]
@@ -460,6 +463,7 @@ class ValuationModel:
                 ttm_cfo = sum(self.extract(x, "netCashProvidedByOperatingActivities", "", 0, False) for x in cf_list)
                 ttm_da = sum(self.extract(x, "depreciationAndAmortization", "", 0, False) for x in cf_list)
                 adj_fcf_yield = (ttm_cfo - ttm_da*0.5) / m_cap
+                self.fcf_yield_display = format_percent(adj_fcf_yield)
             
             logger.info(f"[Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
 
