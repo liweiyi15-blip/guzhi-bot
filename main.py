@@ -21,30 +21,29 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- 辅助函数：获取 FMP 全量数据 (含预期和历史) ---
+# --- 辅助函数：获取 FMP 全量数据 (过去、现在、未来、风险、位置) ---
 async def get_fmp_data(symbol):
-    """从 FMP 获取 过去、现在、未来 的全量数据"""
+    """从 FMP 获取所有维度的全量数据"""
     async with aiohttp.ClientSession() as session:
         try:
-            # 1. 实时行情
+            # 1. 实时行情 (含 52周高低, 交易量)
             quote_url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
             
-            # 2. 核心指标 (TTM) - 包含 PE, PEG, PS, PB, Debt/Eq 等
+            # 2. 核心指标 (含 负债率, ROE, 毛利率 等)
             metrics_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{symbol}?apikey={FMP_API_KEY}"
             
-            # 3. 现金流表 (取最近2年，用于对比趋势)
+            # 3. 现金流表 (趋势)
             cf_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{symbol}?period=annual&limit=2&apikey={FMP_API_KEY}"
 
-            # 4. 损益表 (取最近2年，用于对比营收利润趋势)
+            # 4. 损益表 (趋势)
             is_url = f"https://financialmodelingprep.com/api/v3/income-statement/{symbol}?period=annual&limit=2&apikey={FMP_API_KEY}"
             
-            # 5. 盈利惊喜 (过去表现)
+            # 5. 盈利惊喜 (历史战绩)
             earn_history_url = f"https://financialmodelingprep.com/api/v3/earnings-surprises/{symbol}?apikey={FMP_API_KEY}"
 
-            # 6. 分析师预期 (未来预期) - 获取明年的预期 EPS 和 营收
+            # 6. 分析师预期 (未来分歧)
             estimates_url = f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}?limit=1&apikey={FMP_API_KEY}"
 
-            # 辅助请求函数
             async def fetch(url):
                 async with session.get(url) as response:
                     try:
@@ -52,7 +51,6 @@ async def get_fmp_data(symbol):
                     except:
                         return []
 
-            # 并发请求所有接口
             data_quote, data_metrics, data_cf, data_is, data_history, data_est = await asyncio.gather(
                 fetch(quote_url), fetch(metrics_url), fetch(cf_url), 
                 fetch(is_url), fetch(earn_history_url), fetch(estimates_url)
@@ -63,8 +61,8 @@ async def get_fmp_data(symbol):
             return {
                 "quote": data_quote[0],
                 "metrics": data_metrics[0] if data_metrics else {},
-                "cf": data_cf if data_cf else [],     # List usually
-                "income": data_is if data_is else [], # List usually
+                "cf": data_cf if data_cf else [],
+                "income": data_is if data_is else [],
                 "history": data_history if data_history else [],
                 "estimates": data_est[0] if data_est else {}
             }
@@ -73,94 +71,76 @@ async def get_fmp_data(symbol):
             print(f"FMP API Error: {e}")
             return None
 
-# --- 核心逻辑：DeepSeek 分析 (全数据喂养) ---
+# --- 核心逻辑：DeepSeek 分析 (God Mode Prompt) ---
 async def get_deepseek_analysis(symbol, data):
-    """构建包含过去、现在、未来的超级 Prompt"""
+    """构建包含 估值、基本面、风险、分歧、价格位置 的全量 Prompt"""
     
-    # --- 1. 现在 (估值与价格) ---
+    # 1. 价格与位置
     q = data['quote']
-    m = data['metrics']
     price = q.get('price', 0)
+    high_52 = q.get('yearHigh', price)
+    low_52 = q.get('yearLow', price)
+    dist_high = ((price - high_52) / high_52) * 100 if high_52 else 0 # 距离高点百分比
+    
+    # 2. 估值与效率
+    m = data['metrics']
     pe = q.get('pe', 'N/A')
     peg = m.get('pegRatioTTM', 'N/A')
-    ps = m.get('priceToSalesRatioTTM', 'N/A')
     pb = m.get('priceToBookRatioTTM', 'N/A')
-    beta = m.get('beta', 1.0)
+    roe = m.get('roeTTM', 'N/A') # 净资产收益率
     
-    # --- 2. 过去 (财务趋势：今年 vs 去年) ---
-    inc = data['income'] # List
-    cf = data['cf']      # List
+    # 3. 财务健康 (新增!)
+    debt_equity = m.get('debtToEquityTTM', 'N/A') # 负债率
+    current_ratio = m.get('currentRatioTTM', 'N/A') # 流动比率
     
-    # 营收趋势
-    rev_trend = "未知"
+    # 4. 过去趋势
+    inc = data['income']
+    # 毛利率 (新增!)
+    gross_margin = "N/A"
+    if inc:
+        rev = inc[0].get('revenue', 1)
+        gp = inc[0].get('grossProfit', 0)
+        gross_margin = f"{(gp/rev)*100:.2f}%" if rev else "0%"
+    
+    rev_trend = "持平"
     if len(inc) >= 2:
-        rev_now = inc[0].get('revenue', 0)
-        rev_prev = inc[1].get('revenue', 0)
-        rev_trend = "增长" if rev_now > rev_prev else "下滑"
-    
-    # 利润趋势
-    ni_trend = "未知"
-    if len(inc) >= 2:
-        ni_now = inc[0].get('netIncome', 0)
-        ni_prev = inc[1].get('netIncome', 0)
-        ni_trend = "增长" if ni_now > ni_prev else "下滑"
-        
-    # 现金流趋势
-    fcf_trend = "未知"
-    if len(cf) >= 2:
-        fcf_now = cf[0].get('freeCashFlow', 0)
-        fcf_prev = cf[1].get('freeCashFlow', 0)
-        fcf_trend = "流入增加" if fcf_now > fcf_prev else "流入减少"
+        rev_trend = "增长" if inc[0].get('revenue', 0) > inc[1].get('revenue', 0) else "下滑"
 
-    # --- 3. 历史博弈 (最近4次财报) ---
-    hist = data['history']
-    miss_count = 0
-    for h in hist[:4]:
-        if h.get('estimatedEps', 0) > h.get('actualEps', 0):
-            miss_count += 1
-    beat_status = f"过去4季度{4-miss_count}次超预期，{miss_count}次不及预期"
-
-    # --- 4. 未来 (分析师预期) ---
+    # 5. 未来预期与分歧 (新增 High/Low 对比!)
     est = data['estimates']
-    est_eps = est.get('estimatedEpsAvg', 'N/A')
-    est_rev = est.get('estimatedRevenueAvg', 'N/A')
-    
-    # 构建 Prompt
+    est_eps_avg = est.get('estimatedEpsAvg', 0)
+    est_eps_high = est.get('estimatedEpsHigh', 0)
+    est_eps_low = est.get('estimatedEpsLow', 0)
+    divergence = "极大" if (est_eps_high - est_eps_low) > 1 else "一致" # 简单判断分歧
+
+    # 构建上帝视角 Prompt
     prompt = f"""
-    分析标的: {symbol}
+    深度分析标的: {symbol}
     
-    [全维度数据面板]
-    1. **现状 (估值风险)**:
-       - 价格: ${price}
-       - 估值: PE={pe}, PEG={peg}, P/S={ps}, P/B={pb}
-       - 波动: Beta={beta}
+    [全息数据面板]
+    1. **交易盘口**: 现价${price} (距离52周高点 {dist_high:.1f}%)。
+    2. **估值水位**: PE={pe}, PEG={peg}, PB={pb}。
+    3. **盈利质量**: ROE(净资产收益率)={roe}, 毛利率={gross_margin}。
+    4. **财务排雷**: 负债权益比={debt_equity} (关注是否过高), 流动比率={current_ratio} (短期偿债能力)。
+    5. **趋势动能**: 营收{rev_trend}，历史业绩符合度(是否经常暴雷)。
+    6. **预期分歧**: 华尔街对下期EPS预测分歧度为[{divergence}] (High:{est_eps_high} vs Low:{est_eps_low})。
     
-    2. **过去 (经营趋势)**:
-       - 营收趋势: {rev_trend}
-       - 净利润趋势: {ni_trend}
-       - 自由现金流: {fcf_trend}
-       - 历史战绩: {beat_status}
-       
-    3. **未来 (市场预期)**:
-       - 华尔街预计下期EPS: {est_eps}
-       - 华尔街预计下期营收: {est_rev}
-    
-    任务：请根据上述“过去表现”与“未来预期”的匹配度，结合当前“估值水位”，写一段策略总结。
+    任务：请综合“估值性价比”、“财务安全性”和“市场预期差”这三个维度，给出一份简报。
     
     【绝对禁令】：
-    1. **禁止出现任何数字**。不要写"PE是50"，要写"估值极高"；不要写"增长10%"，要写"温和增长"。
-    2. **禁止给标签**。不要输出【Meme】之类的标题。
+    1. **禁止出现任何数字** (把数字转化为定性描述，如：负债高企、毛利极厚、估值低估)。
+    2. **禁止给标签** (不要输出【XXX】)。
     3. **60字以内**。
-    4. 风格：像一个老练的基金经理在做简报，只说核心逻辑（比如：业绩能否支撑估值，是否存在错杀）。
+    4. 风格：像华尔街首席策略师的晨会发言，一针见血。
     
     输出示例：
-    基本面稳健且现金流持续改善，但当前估值已透支未来两年的增长预期，建议等待回调后再行介入。
+    虽然毛利极厚且现金流充裕，但极高的负债率和市场对未来的巨大分歧限制了上涨空间，当前价格风险收益比不佳。
     """
 
     payload = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "你是一个资深基本面量化分析师。"},
+            {"role": "system", "content": "你是一个基于全量数据做决策的对冲基金经理。"},
             {"role": "user", "content": prompt}
         ],
         "temperature": 1.1, 
@@ -174,16 +154,15 @@ async def get_deepseek_analysis(symbol, data):
                     content = result['choices'][0]['message']['content']
                     return content.strip()
                 else:
-                    return "数据逻辑复杂，建议结合图表判断。"
+                    return "数据模型计算中，暂时无法输出策略。"
         except Exception as e:
             print(f"DeepSeek Error: {e}")
-            return "AI分析服务暂时离线。"
+            return "AI 接口暂时离线。"
 
-# --- 核心逻辑：计算因子 (保留原逻辑) ---
+# --- 核心逻辑：计算因子 (保持原样) ---
 def calculate_factors(data):
     quote = data['quote']
     metrics = data['metrics']
-    # 注意：现在 cf 是个 list
     cf_list = data['cf']
     cf_item = cf_list[0] if cf_list else {}
     
@@ -193,7 +172,7 @@ def calculate_factors(data):
     beta = metrics.get('beta', 1.0)
     pe = quote.get('pe', 0)
     meme_score = 0
-    if beta > 1.5: meme_score += 40
+    if beta is not None and beta > 1.5: meme_score += 40
     if pe is None or pe > 100: meme_score += 40
     
     if meme_score >= 60:
@@ -240,7 +219,7 @@ def calculate_factors(data):
 @bot.command(name="analyze")
 async def analyze_stock(ctx, symbol: str):
     symbol = symbol.upper()
-    status_msg = await ctx.send(f"🔄 正在全网搜集 {symbol} 的 历史财报、未来预期 及 实时估值数据 ...")
+    status_msg = await ctx.send(f"🔄 正在全网搜集 {symbol} 的全息数据 (含财务健康、分歧度及未来预期)...")
 
     # 1. 获取数据
     data = await get_fmp_data(symbol)
@@ -250,8 +229,9 @@ async def analyze_stock(ctx, symbol: str):
 
     # 2. 计算因子
     factors_list, meme_val, beta = calculate_factors(data)
-    
-    # 3. 获取 AI 点评 (全量数据 + 无数字模式)
+    if beta is None: beta = 1.0 # fallback
+
+    # 3. 获取 AI 点评 (全量数据)
     ai_strategy = await get_deepseek_analysis(symbol, data)
 
     # 4. 构建 Embed
@@ -289,8 +269,7 @@ async def analyze_stock(ctx, symbol: str):
         factors_text = "\n> \n".join(formatted_factors)
         embed.add_field(name="因子分析", value=factors_text, inline=False)
 
-    # --- 样式: 策略 (不换行，不加粗标题，纯文字) ---
-    # 根据您的要求，这里直接放 deepseek 的返回结果
+    # --- 样式: 策略 (纯文字) ---
     strategy_content = f"**[策略]** {ai_strategy}"
     embed.add_field(name="", value=strategy_content, inline=False)
 
