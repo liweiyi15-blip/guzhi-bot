@@ -8,6 +8,7 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional, List, Set
+import math
 
 # 加载环境变量
 load_dotenv()
@@ -252,6 +253,21 @@ class ValuationModel:
                 self.signals.add("MACRO_TAILWIND")
                 self.logs.append(f"[宏观红利] 美债收益率 {yield_10y}%，有利于估值扩张。")
 
+            # === 新增：风险价值 (VaR) 计算修复 ===
+            # 使用 Beta 和 VIX 估算月度风险
+            # 逻辑：个股波动率 ≈ Beta * 市场波动率(VIX)
+            # 95% 月度 VaR ≈ 1.65 * (Beta * VIX/100) * sqrt(1/12) * Price
+            if beta and price and isinstance(vix_data, dict):
+                vix_val = vix_data.get("price")
+                if vix_val:
+                    estimated_vol_annual = beta * (vix_val / 100.0)
+                    monthly_vol = estimated_vol_annual * math.sqrt(1/12)
+                    var_95_pct = 1.65 * monthly_vol
+                    loss_amount = price * var_95_pct
+                    self.risk_var = f"-{format_percent(var_95_pct)} (${loss_amount:.2f})"
+                    # 如果 VaR > 25%，标记极高风险
+                    if var_95_pct > 0.25: self.signals.add("RISK_EXTREME_VAR")
+
             # === 3. 维度收集 (Flags) ===
             
             # (A) 赛道与属性
@@ -344,6 +360,9 @@ class ValuationModel:
                 self.signals.add("QUALITY_GOOD")
             elif roic and roic < 0:
                 self.signals.add("QUALITY_BAD")
+            else:
+                 # 补充：ROIC 0-10% 的情况
+                 self.signals.add("QUALITY_AVG")
 
             if fcf_used is not None:
                 if fcf_used > 0.035: 
@@ -404,6 +423,7 @@ class ValuationModel:
         
         is_quality_top = "QUALITY_TOP_TIER" in s
         is_quality_bad = "QUALITY_BAD" in s
+        is_quality_avg = "QUALITY_AVG" in s or "QUALITY_GOOD" in s
         
         is_cash_rich = "CASHFLOW_RICH" in s or "CASHFLOW_HEALTHY" in s
         is_cash_bad = "CASHFLOW_NEGATIVE" in s
@@ -414,7 +434,7 @@ class ValuationModel:
         
         is_risk = "DEEP_LOSS" in s or "DOWNTREND" in s or "VALUE_TRAP_RISK" in s
 
-        # --- 策略库 (Total: 28种) ---
+        # --- 策略库 (Total: 31种, 新增3种) ---
         
         # 1. 风险组
         if "DEEP_LOSS" in s and "DOWNTREND" in s:
@@ -462,6 +482,11 @@ class ValuationModel:
             self.strategy = "【溢价核心】公司极其优秀，市场已给予很高的确定性溢价。适合通过长期持有，用业绩增长来消化估值。"
             return
 
+        # === 补丁：填补 Top Quality 但增长一般且估值合理的真空 ===
+        if is_quality_top and is_fair and is_growth_low:
+             self.strategy = "【成熟稳健】顶级护城河，但进入成熟期增长放缓。估值合理，适合作为防御性底仓，赚取稳健的业绩回报。"
+             return
+
         if is_quality_top and is_expensive and not is_growth_high:
             self.strategy = "【高估值债】虽然质量极好，但增长放缓，当前高估值透支了未来收益，类似一张昂贵的债券，性价比不高。"
             return
@@ -483,7 +508,12 @@ class ValuationModel:
         if is_cheap and is_cash_rich:
             self.strategy = "【深度价值/烟蒂】估值极低且账上现金充沛，下行空间被现金价值封杀。属于经典的防御性价值投资。"
             return
-            
+        
+        # === 补丁：投机性反弹 (高成长但现金流差) ===
+        if is_cheap and is_cash_bad and is_growth_high:
+             self.strategy = "【投机性反弹】现金流虽差，但估值极低且预期增长极高。若非破产风险，存在巨大的估值修复空间，博赔率。"
+             return
+
         if is_cheap and is_cash_bad:
             self.strategy = "【困境反转】价格极低，反映了市场对其现金流问题的担忧。若能改善经营，反弹空间巨大，属于高风险高回报。"
             return
@@ -518,9 +548,14 @@ class ValuationModel:
             self.strategy = "【巨头躺平】超大市值巨头，估值合理。预期收益率即为市场平均回报，适合被动配置。"
             return
 
+        # === 补丁：填补平庸地带 ===
+        if is_fair and is_quality_avg and not is_growth_high:
+            self.strategy = "【中性/观望】基本面平庸，估值合理。缺乏明显的做多或做空理由，建议观望，等待业绩催化或估值变动。"
+            return
+
         # 8. 兜底 (真空区)
         # 如果以上所有情况都没命中，说明这只股票特征非常模糊
-        self.strategy = "数据不足"
+        self.strategy = "数据不足 (特征不明显)"
 
     def get_short_term_verdict(self, ev_ebitda, sector_avg):
         s = self.signals
@@ -623,6 +658,7 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     )
     embed.add_field(name="核心特征", value=core_factors, inline=False)
     
+    # 修复：确保 risk_var 显示
     if data['risk_var'] != "N/A":
         embed.add_field(
             name="95% VaR (月度风险)", 
