@@ -141,7 +141,7 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
         
-        # 信号篮子 (用于策略判断)
+        # 信号篮子
         self.signals = set()
 
     def extract(self, source, key, desc, default=None, required=True):
@@ -244,7 +244,7 @@ class ValuationModel:
             ni_growth = self.extract(g, "netIncomeGrowth", "NI Growth", required=False)
             rev_growth = self.extract(g, "revenueGrowth", "Rev Growth", required=False)
             
-            # 【提前计算】盈利检查 (用于决定后续估值逻辑)
+            # 【关键】提前判断盈利状态
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0)
 
@@ -413,12 +413,15 @@ class ValuationModel:
                 if peg_status != "N/A":
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
 
-            # (E) 估值水平 (Valuation - Modified for Scientific Logic)
+            # (E) 估值水平 (Valuation - Scientific & Dialectic Logic)
             sector_avg = get_sector_benchmark(sector)
             
-            # --- P/S 逻辑 (亏损强制显示，盈利条件显示) ---
+            # --- P/S 逻辑 (亏损强制显示，盈利则隐藏，除非极度泡沫或蓝海) ---
             if ps_ratio is not None:
-                # 判别逻辑：如果是亏损股，或者P/S极高（泡沫预警），或者属于BlueOcean（行业惯例），则显示P/S
+                # 辩证判断：什么时候该看 P/S？
+                # 1. 亏损股 (没有利润，只能看营收)
+                # 2. 泡沫预警 (P/S > 10，即使盈利，这么高的P/S也说明价格透支)
+                # 3. 蓝海赛道 (行业惯例看 P/S)
                 should_show_ps = (not is_profitable_strict) or (ps_ratio > 10.0) or is_blue_ocean
                 
                 if should_show_ps:
@@ -438,12 +441,14 @@ class ValuationModel:
                         self.signals.add("PS_EXTREME")
                         ps_desc = "极高，价格已透支未来多年的增长"
                     
+                    # 标签区分
                     tag = "[蓝海赛道]" if is_blue_ocean else "[估值警示]"
-                    if not is_profitable_strict: tag = "[核心估值]" # 亏损股的核心指标
+                    if not is_profitable_strict: tag = "[核心估值]" # 亏损股的核心指标就是 P/S
                     
                     self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
 
             # --- EV/EBITDA 逻辑 (盈利强制显示，亏损隐藏) ---
+            # 只有盈利公司，EV/EBITDA 才有估值锚点意义
             if is_profitable_strict and ev_ebitda is not None:
                 ratio = ev_ebitda / sector_avg
                 adj_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -559,8 +564,8 @@ class ValuationModel:
     def determine_strategy_exhaustive(self):
         s = self.signals
         
-        # 预计算布尔值，方便组合逻辑书写
-        is_cheap = "VALUATION_CHEAP" in s
+        # 预计算布尔值
+        is_cheap = "VALUATION_CHEAP" in s # 注意：只有盈利公司才会有这个tag
         is_expensive = "VALUATION_EXPENSIVE" in s
         is_fair = "VALUATION_FAIR" in s
         
@@ -653,15 +658,18 @@ class ValuationModel:
             return
         
         # === 补丁 ===
-        if is_cheap and is_cash_bad and is_growth_high:
+        # 【投机性反弹】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
+        if (is_cheap or "PS_LOW" in s) and is_cash_bad and is_growth_high:
              self.strategy = "【投机性反弹】现金流虽差，但估值极低且预期增长极高。若非破产风险，存在巨大的估值修复空间，博赔率。"
              return
 
-        if is_cheap and is_cash_bad:
+        # 【困境反转】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
+        if (is_cheap or "PS_LOW" in s) and is_cash_bad:
             self.strategy = "【困境反转】价格极低，反映了市场对其现金流问题的担忧。若能改善经营，反弹空间巨大，属于高风险高回报。"
             return
             
-        if is_cheap and not is_quality_bad:
+        # 【超跌反弹】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
+        if (is_cheap or "PS_LOW" in s) and not is_quality_bad:
             self.strategy = "【超跌反弹】估值显著低于行业平均，存在修复需求。建议关注是否有基本面改善的催化剂。"
             return
 
