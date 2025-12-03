@@ -10,26 +10,26 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Set
 import math
 
-# 加载环境变量
+# Load environment variables
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
 
-# *** 核心：全局唯一接口地址 (Stable) ***
+# *** Core: Global Unique API URL (Stable) ***
 BASE_URL = "https://financialmodelingprep.com/stable"
 
-# --- 全局状态 ---
+# --- Global State ---
 PRIVACY_MODE = {}
 
-# --- 白名单 ---
+# --- Whitelists ---
 HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN"]
 
-# --- 关键词词典 ---
+# --- Keyword Dictionaries ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
 HARD_TECH_KEYWORDS = ["semiconductor", "artificial intelligence", "software", "auto", "biotech", "internet"]
 
-# --- 日志配置 ---
+# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 异步数据工具函数 ---
+# --- 1. Async Data Utility Functions ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
     try:
@@ -141,7 +141,7 @@ class ValuationModel:
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
         
-        # 信号篮子
+        # Signal Basket
         self.signals = set()
 
     def extract(self, source, key, desc, default=None, required=True):
@@ -198,7 +198,6 @@ class ValuationModel:
                 else:
                     success_keys.append(k)
         
-        # Log API Status
         total_endpoints = len(tasks_generic)
         failed_count = total_endpoints - len(success_keys)
         logger.info(f"[API Status] Success: {len(success_keys)} | Failed: {failed_count} endpoints.")
@@ -207,7 +206,7 @@ class ValuationModel:
 
     def analyze(self):
         try:
-            # 数据解包
+            # Data Unpacking
             p = self.data.get("profile", {}) or {}
             q = self.data.get("quote", {}) or {}
             m = self.data.get("metrics", {}) or {} 
@@ -222,7 +221,7 @@ class ValuationModel:
             
             if not p: return None
 
-            # === 1. 基础数据收集 ===
+            # === 1. Basic Data Collection ===
             price = self.extract(q, "price", "Quote Price", default=p.get("price"))
             price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
             sector = self.extract(p, "sector", "Sector", default="Unknown")
@@ -244,7 +243,7 @@ class ValuationModel:
             ni_growth = self.extract(g, "netIncomeGrowth", "NI Growth", required=False)
             rev_growth = self.extract(g, "revenueGrowth", "Rev Growth", required=False)
             
-            # 【关键】提前判断盈利状态
+            # --- Profitability Check ---
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             is_profitable_strict = (eps_ttm is not None and eps_ttm > 0)
 
@@ -265,7 +264,7 @@ class ValuationModel:
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
             logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
 
-            # === 2. 宏观修正 & 风险 ===
+            # === 2. Macro & Risk ===
             yield_10y = self.extract(t, 'year10', "10Y Yield", required=False)
             macro_discount_factor = 1.0 
             if yield_10y and yield_10y > 4.8:
@@ -277,19 +276,26 @@ class ValuationModel:
                 self.signals.add("MACRO_TAILWIND")
                 self.logs.append(f"[宏观红利] 美债收益率 {yield_10y}%，有利于估值扩张。")
 
-            # VaR Calculation (Only Percent)
+            # --- VaR Calculation (Scientific Improvement: Fat Tail Adjustment) ---
             if beta and price and isinstance(vix_data, dict):
                 vix_val = vix_data.get("price")
                 if vix_val:
                     estimated_vol_annual = beta * (vix_val / 100.0)
                     monthly_vol = estimated_vol_annual * math.sqrt(1/12)
                     var_95_pct = 1.65 * monthly_vol
+                    
+                    # [Fat Tail Adjustment]
+                    # If high beta (>1.5) or loss-making, assume non-normal distribution (fat tails)
+                    # We add a 20% buffer to the VaR estimate for safety.
+                    if beta > 1.5 or not is_profitable_strict:
+                        var_95_pct *= 1.2
+                    
                     self.risk_var = f"-{format_percent(var_95_pct)}"
                     if var_95_pct > 0.25: self.signals.add("RISK_EXTREME_VAR")
 
-            # === 3. 维度收集与详尽因子分析 ===
+            # === 3. Dimensions & Signals ===
             
-            # (A) 赛道与属性
+            # (A) Sector & Attributes
             is_blue_ocean = False        
             is_hard_tech = False 
             sec_str = str(sector).lower(); ind_str = str(industry).lower()
@@ -306,7 +312,7 @@ class ValuationModel:
             is_giant = m_cap is not None and m_cap > 200_000_000_000
             if is_giant: self.signals.add("GIANT_CAP")
 
-            # (B) Meme / 信仰值分析
+            # (B) Meme / Faith
             meme_score = 0
             vol_today = self.extract(q, "volume", "Volume", required=False)
             vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
@@ -349,12 +355,12 @@ class ValuationModel:
                 
                 if meme_log: self.logs.insert(0, meme_log)
 
-            # (C) 盈利质量
+            # (C) Quality
             if net_margin and net_margin > 0.20:
                 self.logs.append(f"[盈利质量] 净利率 ({format_percent(net_margin)}) 极高，展现出强大的产品定价权或成本控制力。")
             if net_margin and net_margin < -0.10: self.signals.add("DEEP_LOSS")
 
-            # (D) 成长性 (PEG & Growth)
+            # (D) Growth & PEG
             forward_peg = None
             fwd_growth = None
             if estimates and len(estimates) > 0 and price:
@@ -373,7 +379,6 @@ class ValuationModel:
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
             
-            # Log PEG Decision
             logger.info(f"[PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
 
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
@@ -413,42 +418,36 @@ class ValuationModel:
                 if peg_status != "N/A":
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
 
-            # (E) 估值水平 (Valuation - Scientific & Dialectic Logic)
+            # (E) Valuation (Strict Logic)
             sector_avg = get_sector_benchmark(sector)
             
-            # --- P/S 逻辑 (亏损强制显示，盈利则隐藏，除非极度泡沫或蓝海) ---
-            if ps_ratio is not None:
-                # 辩证判断：什么时候该看 P/S？
-                # 1. 亏损股 (没有利润，只能看营收)
-                # 2. 泡沫预警 (P/S > 10，即使盈利，这么高的P/S也说明价格透支)
-                # 3. 蓝海赛道 (行业惯例看 P/S)
-                should_show_ps = (not is_profitable_strict) or (ps_ratio > 10.0) or is_blue_ocean
+            # P/S Logic
+            should_show_ps = (not is_profitable_strict) or (ev_ebitda is None)
+            if ps_ratio is not None and should_show_ps:
+                th_low, th_fair, th_high = 1.5, 3.0, 8.0
+                if is_blue_ocean: th_low, th_fair, th_high = 2.0, 5.0, 15.0
+                th_low *= macro_discount_factor; th_fair *= macro_discount_factor; th_high *= macro_discount_factor
                 
-                if should_show_ps:
-                    th_low, th_fair, th_high = 1.5, 3.0, 8.0
-                    if is_blue_ocean: th_low, th_fair, th_high = 2.0, 5.0, 15.0
-                    th_low *= macro_discount_factor; th_fair *= macro_discount_factor; th_high *= macro_discount_factor
-                    
-                    ps_desc = ""
-                    if ps_ratio < th_low: 
-                        self.signals.add("PS_LOW")
-                        ps_desc = "处于历史低位，相对于营收规模被低估"
-                    elif ps_ratio < th_fair: 
-                        ps_desc = "处于合理区间"
-                    elif ps_ratio < th_high: 
-                        ps_desc = "较高，市场给予了较高的增长溢价"
-                    else: 
-                        self.signals.add("PS_EXTREME")
-                        ps_desc = "极高，价格已透支未来多年的增长"
-                    
-                    # 标签区分
-                    tag = "[蓝海赛道]" if is_blue_ocean else "[估值警示]"
-                    if not is_profitable_strict: tag = "[核心估值]" # 亏损股的核心指标就是 P/S
-                    
-                    self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
+                ps_desc = ""
+                if ps_ratio < th_low: 
+                    self.signals.add("PS_LOW")
+                    ps_desc = "处于历史低位，相对于营收规模被低估"
+                elif ps_ratio < th_fair: 
+                    ps_desc = "处于合理区间"
+                elif ps_ratio < th_high: 
+                    ps_desc = "较高，市场给予了较高的增长溢价"
+                else: 
+                    self.signals.add("PS_EXTREME")
+                    ps_desc = "极高，价格已透支未来多年的增长"
+                
+                tag = "[蓝海赛道]" if is_blue_ocean else "[核心估值]"
+                self.logs.append(f"{tag} P/S 估值：{format_num(ps_ratio)} ({ps_desc})。")
+            
+            if ps_ratio is not None and not should_show_ps:
+                 if ps_ratio > 20.0: self.signals.add("PS_EXTREME")
+                 if ps_ratio < 2.0: self.signals.add("PS_LOW")
 
-            # --- EV/EBITDA 逻辑 (盈利强制显示，亏损隐藏) ---
-            # 只有盈利公司，EV/EBITDA 才有估值锚点意义
+            # EV/EBITDA Logic
             if is_profitable_strict and ev_ebitda is not None:
                 ratio = ev_ebitda / sector_avg
                 adj_ratio = ratio / macro_discount_factor if macro_discount_factor != 0 else ratio
@@ -466,7 +465,7 @@ class ValuationModel:
                     self.signals.add("VALUATION_FAIR")
                     self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 与行业均值 ({sector_avg}) 接近，估值处于合理区间。")
 
-            # (F) 质量与效率 (Quality & FCF)
+            # (F) Cash Flow & Efficiency
             adj_fcf_yield = None
             if len(cf_list) >= 4 and m_cap and m_cap > 0:
                 ttm_cfo = sum(self.extract(q, "netCashProvidedByOperatingActivities", "", default=0, required=False) for q in cf_list)
@@ -477,11 +476,8 @@ class ValuationModel:
                     self.fcf_yield_display = format_percent(adj_fcf_yield)
 
             fcf_used = adj_fcf_yield if adj_fcf_yield is not None else fcf_yield_api
-            
-            # Log Cash Flow
             logger.info(f"[Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
 
-            # ROIC Logs
             if roic and roic > 0.20: 
                 self.signals.add("QUALITY_TOP_TIER") 
                 self.logs.append(f"[护城河] ROIC ({format_percent(roic)}) 极高，资本效率顶级。")
@@ -492,7 +488,6 @@ class ValuationModel:
             else:
                  self.signals.add("QUALITY_AVG")
 
-            # FCF Analysis Logs
             if fcf_used is not None:
                 if fcf_used > 0.035: self.signals.add("CASHFLOW_RICH") 
                 elif fcf_used > 0.015: self.signals.add("CASHFLOW_HEALTHY")
@@ -506,7 +501,7 @@ class ValuationModel:
                         else:
                             self.logs.append(f"[价值修正] Adj FCF Yield ({self.fcf_yield_display}) 高于 原始 FCF ({format_percent(fcf_yield_api)})，反映出增长性资本支出的积极影响。")
 
-            # (G) 业绩 Alpha
+            # (G) Earnings Alpha & Turnaround
             valid_earnings = []
             if isinstance(earnings_raw, list):
                 sorted_earnings = sorted(earnings_raw, key=lambda x: x.get("date", "0000-00-00"), reverse=True)
@@ -531,15 +526,26 @@ class ValuationModel:
                         self.logs.append(f"[Alpha] 过去 {total} 季度中有 {beats} 次业绩超预期，机构情绪乐观。")
                     else:
                         self.logs.append(f"[Alpha] 过去 {total} 季度中有 {total - beats} 次业绩不及预期，需警惕。")
+                
+                # Turnaround Check
+                if len(recent_4) >= 3:
+                    epss = [x["eps"] for x in recent_4]
+                    if all(e < 0 for e in epss[:-1]) and epss[-1] > 0:
+                        self.signals.add("TURNAROUND_PROFIT")
+                        self.logs.append(f"[反转信号] **扭亏为盈**。本季 EPS 首次转正，基本面迎来关键拐点。")
+                    elif all(e < 0 for e in epss):
+                        if epss[-1] > epss[-2]:
+                            self.signals.add("LOSS_NARROWING")
+                            self.logs.append(f"[反转信号] 亏损环比收窄。经营效率提升，距离盈利平衡点渐近。")
 
-            # Other Risks
+            # Risks
             if price and price_200ma and price < price_200ma: self.signals.add("DOWNTREND")
             if pe_ttm and pe_ttm < 8 and rev_growth and rev_growth < -0.05: 
                 self.signals.add("VALUE_TRAP_RISK")
                 self.logs.append(f"[陷阱] PE ({format_num(pe_ttm)}) 虽低，但营收负增长，疑似周期顶部信号。")
             if beta and beta < 0.6: self.signals.add("LOW_VOLATILITY")
 
-            # === 4. 综合策略解算 (穷举模式) ===
+            # === 4. Exhaustive Strategy ===
             self.determine_strategy_exhaustive()
             
             self.short_term_verdict = self.get_short_term_verdict(ev_ebitda, sector_avg)
@@ -560,12 +566,10 @@ class ValuationModel:
             logger.error(traceback.format_exc())
             return None
 
-    # --- 穷举策略核心函数 ---
     def determine_strategy_exhaustive(self):
         s = self.signals
         
-        # 预计算布尔值
-        is_cheap = "VALUATION_CHEAP" in s # 注意：只有盈利公司才会有这个tag
+        is_cheap = "VALUATION_CHEAP" in s
         is_expensive = "VALUATION_EXPENSIVE" in s
         is_fair = "VALUATION_FAIR" in s
         
@@ -582,12 +586,28 @@ class ValuationModel:
         
         is_risk = "DEEP_LOSS" in s or "DOWNTREND" in s or "VALUE_TRAP_RISK" in s
 
-        # --- 策略库 (Total: 31种) ---
+        # --- Strategy Library (Priority Sorted) ---
         
-        # 1. 风险组
-        if "DEEP_LOSS" in s and "DOWNTREND" in s:
-            self.strategy = "【接飞刀风险】深度亏损且股价处于下降趋势，基本面与技术面双杀，风险极大，建议回避。"
+        # 1. Special & High Priority
+        if "MEME_EXTREME" in s:
+            self.strategy = "【Meme动量】市场情绪处于极度狂热状态。基本面指标已失效，交易需完全基于资金面和动量指标，快进快出。"
             return
+        
+        # [RKLB Fix] Blue Ocean Priority Elevated
+        if "BLUE_OCEAN" in s:
+            self.strategy = "【蓝海卡位】处于前沿科技赛道，估值锚点在于远期的行业垄断地位。适合在技术回调时分批布局，博弈长线爆发。"
+            return
+
+        if "HARD_TECH" in s and "PS_LOW" in s:
+            self.strategy = "【硬科技期权】硬科技属性明确，且P/S处于低位。市场暂时忽略了其技术壁垒，具备看涨期权属性。"
+            return
+
+        # 2. Risk Group (with Exceptions)
+        if "DEEP_LOSS" in s and "DOWNTREND" in s:
+            if "LOSS_NARROWING" not in s and "TURNAROUND_PROFIT" not in s:
+                self.strategy = "【接飞刀风险】深度亏损且股价处于下降趋势，基本面与技术面双杀，风险极大，建议回避。"
+                return
+
         if is_growth_high and is_cash_bad and not is_quality_top:
             self.strategy = "【烧钱陷阱】增长主要依赖高额烧钱（负现金流），且资本效率(ROIC)一般。流动性收紧时面临融资风险。"
             return
@@ -598,18 +618,7 @@ class ValuationModel:
             self.strategy = "【低估值陷阱】市盈率极低，但营收处于萎缩周期。这通常是周期顶部的信号，谨防业绩暴雷。"
             return
 
-        # 2. 特殊组
-        if "MEME_EXTREME" in s:
-            self.strategy = "【Meme动量】市场情绪处于极度狂热状态。基本面指标已失效，交易需完全基于资金面和动量指标，快进快出。"
-            return
-        if "BLUE_OCEAN" in s:
-            self.strategy = "【蓝海卡位】处于前沿科技赛道，估值锚点在于远期的行业垄断地位。适合在技术回调时分批布局，博弈长线爆发。"
-            return
-        if "HARD_TECH" in s and "PS_LOW" in s:
-            self.strategy = "【硬科技期权】硬科技属性明确，且P/S处于低位。市场暂时忽略了其技术壁垒，具备看涨期权属性。"
-            return
-
-        # 3. 黄金/核心组 (Priority High)
+        # 3. Gold & Core Assets
         if is_cheap and is_quality_top and is_cash_rich:
             self.strategy = "【黄金配置窗口】不可能三角达成！顶级资本效率(ROIC) + 充沛现金流 + 估值折价。极为罕见的错杀机会，强烈建议买入。"
             return
@@ -630,7 +639,6 @@ class ValuationModel:
             self.strategy = "【溢价核心】公司极其优秀，市场已给予很高的确定性溢价。适合通过长期持有，用业绩增长来消化估值。"
             return
 
-        # === 补丁 ===
         if is_quality_top and is_fair and is_growth_low:
              self.strategy = "【成熟稳健】顶级护城河，但进入成熟期增长放缓。估值合理，适合作为防御性底仓，赚取稳健的业绩回报。"
              return
@@ -639,7 +647,7 @@ class ValuationModel:
             self.strategy = "【高估值债】虽然质量极好，但增长放缓，当前高估值透支了未来收益，类似一张昂贵的债券，性价比不高。"
             return
 
-        # 4. 成长组
+        # 4. Growth Group
         if is_peg_cheap and not is_quality_top:
             self.strategy = "【高性价比成长】PEG极低，显示增长潜力被低估。虽然护城河不如核心资产深，但赔率很高，适合做进攻配置。"
             return
@@ -652,28 +660,32 @@ class ValuationModel:
             self.strategy = "【高风偏博弈】增长极快但市销率极高，价格完美定价了未来多年的预期。任何微小的业绩瑕疵都可能引发剧烈回调。"
             return
 
-        # 5. 价值组
+        # 5. Value Group
         if is_cheap and is_cash_rich:
             self.strategy = "【深度价值/烟蒂】估值极低且账上现金充沛，下行空间被现金价值封杀。属于经典的防御性价值投资。"
             return
         
-        # === 补丁 ===
-        # 【投机性反弹】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
+        if "TURNAROUND_PROFIT" in s:
+             self.strategy = "【困境反转】业绩出现明确拐点，首次扭亏为盈。这是基本面最强的右侧信号，建议右侧跟随。"
+             return
+
+        if (is_cheap or "PS_LOW" in s) and "LOSS_NARROWING" in s:
+             self.strategy = "【左侧博弈】虽然股价趋势向下，但亏损幅度持续收窄，且估值极低。适合偏好左侧交易的激进资金博弈反转。"
+             return
+
         if (is_cheap or "PS_LOW" in s) and is_cash_bad and is_growth_high:
              self.strategy = "【投机性反弹】现金流虽差，但估值极低且预期增长极高。若非破产风险，存在巨大的估值修复空间，博赔率。"
              return
 
-        # 【困境反转】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
         if (is_cheap or "PS_LOW" in s) and is_cash_bad:
             self.strategy = "【困境反转】价格极低，反映了市场对其现金流问题的担忧。若能改善经营，反弹空间巨大，属于高风险高回报。"
             return
             
-        # 【超跌反弹】修正：支持 PS_LOW（针对亏损股）或 VALUATION_CHEAP（针对盈利股）
         if (is_cheap or "PS_LOW" in s) and not is_quality_bad:
             self.strategy = "【超跌反弹】估值显著低于行业平均，存在修复需求。建议关注是否有基本面改善的催化剂。"
             return
 
-        # 6. 泡沫/高估组
+        # 6. Bubble Group
         if is_expensive and not is_growth_high and not is_quality_top:
             self.strategy = "【泡沫风险】估值昂贵，且缺乏高增长或高效率支撑。价格严重脱离基本面，建议回避或减仓。"
             return
@@ -682,7 +694,7 @@ class ValuationModel:
             self.strategy = "【概念炒作】虽然有增长，但质量极差且估值过高。典型的概念炒作特征，潮水退去后风险很大。"
             return
 
-        # 7. 中庸/防御组
+        # 7. Neutral/Defense Group
         if is_fair and is_growth_high:
             self.strategy = "【GARP策略】以合理价格买入高成长。性价比较高，是比较稳健的成长股投资策略。"
             return
@@ -699,12 +711,11 @@ class ValuationModel:
             self.strategy = "【巨头躺平】超大市值巨头，估值合理。预期收益率即为市场平均回报，适合被动配置。"
             return
 
-        # === 补丁 ===
         if is_fair and is_quality_avg and not is_growth_high:
             self.strategy = "【中性/观望】基本面平庸，估值合理。缺乏明显的做多或做空理由，建议观望，等待业绩催化或估值变动。"
             return
 
-        # 8. 兜底 (真空区)
+        # 8. Fallback
         self.strategy = "数据不足 (未命中任何策略模型)"
 
     def get_short_term_verdict(self, ev_ebitda, sector_avg):
@@ -742,76 +753,65 @@ class AnalysisBot(commands.Bot):
 
 bot = AnalysisBot()
 
-@bot.tree.command(name="privacy", description="切换隐私查询模式 (开启后分析结果仅自己可见)")
+@bot.tree.command(name="privacy", description="Toggle privacy mode")
 async def privacy(interaction: discord.Interaction):
     user_id = interaction.user.id
     is_on = PRIVACY_MODE.get(user_id, False)
     new_state = not is_on
     PRIVACY_MODE[user_id] = new_state
-    status = "已开启 (查询结果仅自己可见)" if new_state else "已关闭 (查询结果公开)"
-    await interaction.response.send_message(f"[Info] 隐私模式切换成功。\n当前状态: **{status}**", ephemeral=True)
+    status = "On (Private)" if new_state else "Off (Public)"
+    await interaction.response.send_message(f"Privacy Mode: **{status}**", ephemeral=True)
 
 async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
     is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
-    ephemeral_result = is_privacy_mode
     
-    await interaction.response.defer(thinking=True, ephemeral=ephemeral_result) 
+    await interaction.response.defer(thinking=True, ephemeral=is_privacy_mode) 
 
     model = ValuationModel(ticker)
     success = await model.fetch_data(interaction.client.session)
     
     if is_privacy_mode and success:
         public_embed = discord.Embed(
-            description=f"**{interaction.user.display_name}** 开启《稳-量化估值系统》\n“{ticker.upper()}”分析报告已发送给用户✅",
+            description=f"**{interaction.user.display_name}** analyzed {ticker.upper()} (Private Mode) ✅",
             color=0x2b2d31
         )
         try:
             await interaction.channel.send(embed=public_embed) 
-        except Exception as e:
-            logger.error(f"Failed to send public status message: {e}")
+        except Exception: pass
     
     if not success:
-        await interaction.followup.send(f"[Error] 获取数据失败: `{ticker.upper()}`", ephemeral=ephemeral_result)
+        await interaction.followup.send(f"Error fetching data for {ticker.upper()}", ephemeral=is_privacy_mode)
         return
 
     data = model.analyze()
     if not data:
-        await interaction.followup.send(f"[Warning] 数据不足。", ephemeral=ephemeral_result)
+        await interaction.followup.send(f"Insufficient data for {ticker.upper()}", ephemeral=is_privacy_mode)
         return
 
-    profit_label = "盈利" if data.get('is_profitable', False) else "亏损"
+    profit_label = "Profitable" if data.get('is_profitable', False) else "Unprofitable"
 
     embed = discord.Embed(
-        title=f"估值分析: {ticker.upper()}",
-        description=f"现价: ${data['price']:.2f} | 市值: {format_market_cap(data['m_cap'])} | {profit_label}",
+        title=f"Valuation Analysis: {ticker.upper()}",
+        description=f"Price: ${data['price']:.2f} | MCap: {format_market_cap(data['m_cap'])} | {profit_label}",
         color=0x2b2d31
     )
 
     verdict_text = (
-        f"> **短期:** {model.short_term_verdict}\n"
-        f"> **长期:** {model.long_term_verdict}"
+        f"> **Short-term:** {model.short_term_verdict}\n"
+        f"> **Long-term:** {model.long_term_verdict}"
     )
-    embed.add_field(name="估值结论", value=verdict_text, inline=False)
+    embed.add_field(name="Verdict", value=verdict_text, inline=False)
 
-    beta_val = data['beta']
-    beta_desc = "低波动" if beta_val < 0.8 else ("高波动" if beta_val > 1.3 else "适中")
-    
-    meme_pct = data['meme_pct']
-    meme_desc = "低关注度"
-    if meme_pct >= 80: meme_desc = "资金狂热"
-    elif meme_pct >= 60: meme_desc = "高流动性"
-    elif meme_pct >= 30: meme_desc = "市场关注"
-    
     core_factors = (
-        f"> **Beta:** `{format_num(beta_val)}` ({beta_desc})\n"
-        f"> **Meme值:** `{meme_pct}%` ({meme_desc})"
+        f"> **Beta:** `{format_num(data['beta'])}`\n"
+        f"> **Meme:** `{data['meme_pct']}%`"
     )
-    embed.add_field(name="核心特征", value=core_factors, inline=False)
+    embed.add_field(name="Core Traits", value=core_factors, inline=False)
     
     if data['risk_var'] != "N/A":
         embed.add_field(
-            name="95% VaR (月度风险)", 
-            value=f"> 最大回撤可能在 **{data['risk_var']}** 附近", 
+            name="95% VaR (Monthly Risk)", 
+            value=f"> Max Drawdown Est: **{data['risk_var']}**", 
             inline=False
         )
 
@@ -830,32 +830,30 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
             formatted_logs.append(f"> {log}")
 
     factor_str = "\n> \n".join(formatted_logs)
-    strategy_text = f"**[策略]** {model.strategy}"
+    strategy_text = f"**[Strategy]** {model.strategy}"
     full_log_str = f"{factor_str}\n\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
 
-    embed.add_field(name="因子分析", value=full_log_str, inline=False)
-    embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
+    embed.add_field(name="Factor Analysis", value=full_log_str, inline=False)
+    embed.set_footer(text="(Model output for reference only, not financial advice)")
 
-    await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
+    await interaction.followup.send(embed=embed, ephemeral=is_privacy_mode)
 
-@bot.tree.command(name="analyze", description="估值分析 (结果可见性由/privacy决定)")
-@app_commands.describe(ticker="股票代码 (如 NVDA)")
+@bot.tree.command(name="analyze", description="Analyze a stock")
+@app_commands.describe(ticker="Stock Symbol (e.g. NVDA)")
 async def analyze_command(interaction: discord.Interaction, ticker: str):
     await process_analysis(interaction, ticker, force_private=False)
 
-@bot.tree.command(name="private_analyze", description="私密估值分析 (结果仅自己可见，但会在频道内发布状态)")
-@app_commands.describe(ticker="股票代码 (如 NVDA)")
+@bot.tree.command(name="private_analyze", description="Analyze a stock privately")
+@app_commands.describe(ticker="Stock Symbol (e.g. NVDA)")
 async def private_analyze_command(interaction: discord.Interaction, ticker: str):
     await process_analysis(interaction, ticker, force_private=True)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN environment variable not set.")
+        logger.error("DISCORD_TOKEN not set.")
     else:
-        if not FMP_API_KEY:
-             logger.error("FMP_API_KEY environment variable not set.")
         try:
             bot.run(DISCORD_TOKEN)
         except Exception as e:
