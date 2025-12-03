@@ -447,19 +447,19 @@ class ValuationModel:
             return
         
         if is_quality_top and is_peg_cheap:
-            self.strategy = "【成长型核心资产】(如NVDA) 既具备低PEG的强劲进攻性，又有顶级ROIC构建的深厚护城河。完美结合了成长与质量，值得重仓。"
+            self.strategy = "【成长型核心资产】既具备低PEG的强劲进攻性，又有顶级ROIC构建的深厚护城河。完美结合了成长与质量，值得重仓。"
             return
             
         if is_quality_top and is_cheap and not is_cash_rich:
-            self.strategy = "【优质扩张】(如NFLX) 资本效率极高且估值合理。现金流低是因为正在进行高回报的再投入，长期复利效应显著。"
+            self.strategy = "【优质扩张】 资本效率极高且估值合理。现金流低是因为正在进行高回报的再投入，长期复利效应显著。"
             return
             
         if is_quality_top and is_cash_rich and (is_fair or is_cheap):
-            self.strategy = "【现金牛核心】(如GOOG) 行业统治力强，造血能力极强。当前价格公道，适合作为组合的压舱石长期持有。"
+            self.strategy = "【现金牛核心】 行业统治力强，造血能力极强。当前价格公道，适合作为组合的压舱石长期持有。"
             return
             
         if is_quality_top and is_expensive and is_growth_high:
-            self.strategy = "【溢价核心】(如LLY) 公司极其优秀，市场已给予很高的确定性溢价。适合通过长期持有，用业绩增长来消化估值。"
+            self.strategy = "【溢价核心】公司极其优秀，市场已给予很高的确定性溢价。适合通过长期持有，用业绩增长来消化估值。"
             return
 
         if is_quality_top and is_expensive and not is_growth_high:
