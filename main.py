@@ -10,8 +10,8 @@ import asyncio
 # 加载环境变量
 load_dotenv()
 
-# 配置部分
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+# --- 修正点：改回 DISCORD_TOKEN ---
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") 
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -71,7 +71,7 @@ async def get_fmp_data(symbol):
             print(f"FMP API Error: {e}")
             return None
 
-# --- 核心逻辑：DeepSeek 分析 (God Mode Prompt) ---
+# --- 核心逻辑：DeepSeek 分析 (全量数据) ---
 async def get_deepseek_analysis(symbol, data):
     """构建包含 估值、基本面、风险、分歧、价格位置 的全量 Prompt"""
     
@@ -79,23 +79,22 @@ async def get_deepseek_analysis(symbol, data):
     q = data['quote']
     price = q.get('price', 0)
     high_52 = q.get('yearHigh', price)
-    low_52 = q.get('yearLow', price)
-    dist_high = ((price - high_52) / high_52) * 100 if high_52 else 0 # 距离高点百分比
+    dist_high = ((price - high_52) / high_52) * 100 if high_52 else 0 
     
     # 2. 估值与效率
     m = data['metrics']
     pe = q.get('pe', 'N/A')
     peg = m.get('pegRatioTTM', 'N/A')
     pb = m.get('priceToBookRatioTTM', 'N/A')
-    roe = m.get('roeTTM', 'N/A') # 净资产收益率
+    roe = m.get('roeTTM', 'N/A') 
     
-    # 3. 财务健康 (新增!)
-    debt_equity = m.get('debtToEquityTTM', 'N/A') # 负债率
-    current_ratio = m.get('currentRatioTTM', 'N/A') # 流动比率
+    # 3. 财务健康
+    debt_equity = m.get('debtToEquityTTM', 'N/A') 
+    current_ratio = m.get('currentRatioTTM', 'N/A') 
     
     # 4. 过去趋势
     inc = data['income']
-    # 毛利率 (新增!)
+    # 毛利率
     gross_margin = "N/A"
     if inc:
         rev = inc[0].get('revenue', 1)
@@ -106,12 +105,11 @@ async def get_deepseek_analysis(symbol, data):
     if len(inc) >= 2:
         rev_trend = "增长" if inc[0].get('revenue', 0) > inc[1].get('revenue', 0) else "下滑"
 
-    # 5. 未来预期与分歧 (新增 High/Low 对比!)
+    # 5. 未来预期与分歧
     est = data['estimates']
-    est_eps_avg = est.get('estimatedEpsAvg', 0)
     est_eps_high = est.get('estimatedEpsHigh', 0)
     est_eps_low = est.get('estimatedEpsLow', 0)
-    divergence = "极大" if (est_eps_high - est_eps_low) > 1 else "一致" # 简单判断分歧
+    divergence = "极大" if (est_eps_high - est_eps_low) > 1 else "一致" 
 
     # 构建上帝视角 Prompt
     prompt = f"""
@@ -280,4 +278,7 @@ async def analyze_stock(ctx, symbol: str):
 
 # 启动 Bot
 if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+    if not DISCORD_TOKEN:
+        print("【错误】未检测到 DISCORD_TOKEN，请检查环境变量。")
+    else:
+        bot.run(DISCORD_TOKEN)
