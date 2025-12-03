@@ -18,15 +18,17 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
-# *** 接口地址 ***
-FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+# *** 核心：完全还原原代码的全局唯一接口地址 (Stable) ***
+BASE_URL = "https://financialmodelingprep.com/stable"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
 
-# --- 白名单与关键词 ---
+# --- 白名单 ---
 HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN"]
+
+# --- 关键词词典 ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
 HARD_TECH_KEYWORDS = ["semiconductor", "artificial intelligence", "software", "auto", "biotech", "internet"]
 
@@ -38,44 +40,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 异步工具函数 ---
+# --- 1. 异步数据工具函数 (完全还原原版) ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
     try:
         async with session.get(url, timeout=10) as response:
-            if response.status != 200: return None
+            if response.status != 200:
+                logger.warning(f"API Status {response.status} for {url}")
+                return None
             try:
                 data = await response.json()
-                if isinstance(data, dict) and "Error Message" in data: return None
-                return data
-            except: return None
-    except: return None
-
-async def get_fmp_data_original(session: aiohttp.ClientSession, endpoint: str, ticker: str, params: str = ""):
-    url = f"{FMP_BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
-    if params: url += f"&{params}"
-    return await get_json_safely(session, url)
+            except Exception:
+                return None
+            if isinstance(data, dict) and "Error Message" in data:
+                return None
+            return data
+    except Exception:
+        return None
 
 async def get_treasury_rates(session: aiohttp.ClientSession):
     today = datetime.now()
-    url = f"{FMP_BASE_URL}/treasury-rates?from={(today-timedelta(7)).strftime('%Y-%m-%d')}&to={today.strftime('%Y-%m-%d')}&apikey={FMP_API_KEY}"
+    start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+    url = f"{BASE_URL}/treasury-rates?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
     data = await get_json_safely(session, url)
-    return data[0] if data and isinstance(data, list) else None
-
-async def get_company_profile(session: aiohttp.ClientSession, ticker: str):
-    data = await get_json_safely(session, f"{FMP_BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}")
-    if data and isinstance(data, list): return data[0]
-    data_scr = await get_json_safely(session, f"{FMP_BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}")
-    if data_scr and isinstance(data_scr, list): return data_scr[0]
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
     return None
 
-async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
-    return await get_json_safely(session, f"{FMP_BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}") or []
+async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str):
+    url_profile = f"{BASE_URL}/profile?symbol={ticker}&apikey={FMP_API_KEY}"
+    data = await get_json_safely(session, url_profile)
+    if data and isinstance(data, list) and len(data) > 0:
+        return data[0]
+    
+    url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
+    data_scr = await get_json_safely(session, url_screener)
+    if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
+        item = data_scr[0]
+        return {
+            "symbol": item.get("symbol"),
+            "price": item.get("price"),
+            "beta": item.get("beta"),
+            "mktCap": item.get("marketCap"),
+            "companyName": item.get("companyName"),
+            "industry": item.get("industry"), 
+            "sector": item.get("sector"),      
+            "description": "Fetched via Screener",
+            "image": "N/A"
+        }
+    return None
 
+# 【还原】原版通用函数
+async def get_fmp_data(session: aiohttp.ClientSession, endpoint: str, ticker: str, params: str = ""):
+    url = f"{BASE_URL}/{endpoint}?symbol={ticker}&apikey={FMP_API_KEY}"
+    if params: url += f"&{params}"
+    return await get_json_safely(session, url)
+
+# 【还原】独立函数，limit=10
 async def get_estimates_data(session: aiohttp.ClientSession, ticker: str):
-    return await get_json_safely(session, f"{FMP_BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}") or []
+    url = f"{BASE_URL}/analyst-estimates?symbol={ticker}&period=annual&limit=10&apikey={FMP_API_KEY}"
+    data = await get_json_safely(session, url)
+    return data if data else []
 
-# --- 2. DeepSeek 分析引擎 ---
+# 【还原】独立函数
+async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
+    url = f"{BASE_URL}/earnings?symbol={ticker}&apikey={FMP_API_KEY}"
+    data = await get_json_safely(session, url)
+    return data if data else []
+
+# --- DeepSeek 分析引擎 ---
 async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, context_str: str):
     if not DEEPSEEK_API_KEY: return "未配置 DeepSeek Key，无法生成策略。"
     
@@ -84,7 +118,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, con
         "【严格执行以下要求】：\n"
         "1. **严禁出现数字**：用“估值极高”、“资金分歧”等描述代替具体数据。\n"
         "2. **通俗且专业**：用大白话讲透上涨/下跌背后的逻辑（是基本面驱动还是情绪博弈？）。\n"
-        "3. **字数限制**：80字以内！\n"
+        "3. **字数限制**：严格控制在 80 字以内！不要超过！\n"
         "4. **不要给出操作建议**：严禁出现“建议买入”、“止损”、“低吸”等具体交易指令。只陈述事实和逻辑判断。"
     )
     
@@ -95,7 +129,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, con
             {"role": "user", "content": f"标的：{ticker}\n\n{context_str}"}
         ],
         "temperature": 0.6,
-        "max_tokens": 100 
+        "max_tokens": 100
     }
     
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
@@ -108,47 +142,67 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, con
     except: return "AI 请求超时。"
 
 # --- 格式化工具 ---
-def format_percent(num): return f"{num*100:.2f}%" if num is not None else "N/A"
-def format_num(num): return f"{num:.2f}" if num is not None else "N/A"
+def format_percent(num):
+    return f"{num * 100:.2f}%" if num is not None and isinstance(num, (int, float)) else "N/A"
+
+def format_num(num):
+    return f"{num:.2f}" if num is not None and isinstance(num, (int, float)) else "N/A"
+
 def format_market_cap(num):
-    if not num: return "N/A"
-    return f"${num/1e12:.2f}T" if num >= 1e12 else (f"${num/1e9:.2f}B" if num >= 1e9 else f"${num/1e6:.2f}M")
+    if num is None or num == 0: return "N/A"
+    if num >= 1e12: return f"${num/1e12:.2f}T"
+    if num >= 1e9: return f"${num/1e9:.2f}B"
+    return f"${num/1e6:.2f}M"
+
+SECTOR_EBITDA_MEDIAN = {
+    "Technology": 32.0, "Consumer Electronics": 25.0, "Communication Services": 20.0,
+    "Healthcare": 18.0, "Financial Services": 12.0, "Energy": 10.0,
+    "Utilities": 12.0, "Unknown": 18.0
+}
+
 def get_sector_benchmark(sector):
-    bench = {"Technology":32,"Consumer Electronics":25,"Communication":20,"Healthcare":18,"Financial":12,"Energy":10}
-    for k,v in bench.items(): 
-        if k in str(sector): return v
+    if not sector: return 18.0
+    for key in SECTOR_EBITDA_MEDIAN:
+        if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
-# --- 3. 核心：ValuationModel ---
+# --- 2. 核心：ValuationModel ---
 class ValuationModel:
     def __init__(self, ticker):
         self.ticker = ticker.upper()
         self.data = {}
         self.logs = []
         self.signals = set()
-        self.risk_var = "N/A"
         self.short_term_verdict = "未知"
         self.long_term_verdict = "未知"
+        self.risk_var = "N/A"  
         self.context_for_ai = "" 
 
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
         if val is None:
-            return default if default is not None else None
-        return val
+            if default is not None:
+                return default
+            elif not required:
+                return None
+            else:
+                return None
+        else:
+            return val
 
     async def fetch_data(self, session: aiohttp.ClientSession):
         logger.info(f"--- Analysis Start: {self.ticker} ---")
-        task_profile = get_company_profile(session, self.ticker)
+        task_profile = get_company_profile_smart(session, self.ticker)
         task_treasury = get_treasury_rates(session)
+        
         tasks_generic = {
-            "quote": get_fmp_data_original(session, "quote", self.ticker, ""),
-            "metrics": get_fmp_data_original(session, "key-metrics-ttm", self.ticker, ""),
-            "ratios": get_fmp_data_original(session, "ratios-ttm", self.ticker, ""),
-            "growth": get_fmp_data_original(session, "financial-growth", self.ticker, "period=annual&limit=1"),
-            "bs": get_fmp_data_original(session, "balance-sheet-statement", self.ticker, "limit=1"),
-            "cf": get_fmp_data_original(session, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
-            "vix": get_fmp_data_original(session, "quote", "^VIX", ""),
+            "quote": get_fmp_data(session, "quote", self.ticker, ""),
+            "metrics": get_fmp_data(session, "key-metrics-ttm", self.ticker, ""),
+            "ratios": get_fmp_data(session, "ratios-ttm", self.ticker, ""),
+            "growth": get_fmp_data(session, "financial-growth", self.ticker, "period=annual&limit=1"),
+            "bs": get_fmp_data(session, "balance-sheet-statement", self.ticker, "limit=1"),
+            "cf": get_fmp_data(session, "cash-flow-statement", self.ticker, "period=quarter&limit=4"), 
+            "vix": get_fmp_data(session, "quote", "^VIX", ""),
             "earnings": get_earnings_data(session, self.ticker),
             "estimates": get_estimates_data(session, self.ticker)
         }
@@ -176,6 +230,8 @@ class ValuationModel:
                     self.data[k] = {}
                 elif raw is None:
                     self.data[k] = {}
+                else:
+                    success_count += 1
         
         logger.info(f"[API Status] Success: {success_count} | Failed: {len(tasks_generic) - success_count} endpoints.")
         
@@ -197,7 +253,6 @@ class ValuationModel:
             if not p: return None
 
             # === 0. 锁定当前时间轴 ===
-            # 这是所有计算的基准，确保不会用到未来的空数据
             today_str = datetime.now().strftime("%Y-%m-%d")
 
             # === 1. 基础数据 ===
@@ -228,8 +283,7 @@ class ValuationModel:
             net_income = self.extract(m, "netIncomePerShareTTM", "EPS", default=0)
             is_profitable_strict = (net_income is not None and net_income > 0)
 
-            # 【时间轴修正 1：Earnings】 倒推过去，用于Log和Alpha
-            # 过滤掉日期晚于今天的“未来财报日历”数据
+            # Logs
             past_earnings_for_log = [e for e in earnings_raw if e.get("date", "9999-99-99") <= today_str]
             if past_earnings_for_log:
                 latest_q = sorted(past_earnings_for_log, key=lambda x: x.get("date", "0000-00-00"), reverse=True)[0]
@@ -255,8 +309,10 @@ class ValuationModel:
             if beta and price and isinstance(vix_data, dict):
                 vix_val = vix_data.get("price")
                 if vix_val:
-                    vol = beta * (vix_val / 100.0) * math.sqrt(1/12) * 1.65
-                    if beta > 1.5 or not is_profitable_strict: vol *= 1.2
+                    # 【修复点：变量名错误】
+                    var_95_pct = beta * (vix_val / 100.0) * math.sqrt(1/12) * 1.65
+                    if beta > 1.5 or not is_profitable_strict:
+                        var_95_pct *= 1.2
                     self.risk_var = f"-{format_percent(var_95_pct)}"
 
             # === 3. 维度分析 ===
@@ -312,14 +368,12 @@ class ValuationModel:
             if net_margin and net_margin < -0.10: self.signals.add("DEEP_LOSS")
 
             # (D) PEG & Growth
-            # 【时间轴修正 2：Estimates】 前推未来，用于 Forward PEG
-            # 过滤掉已经过期的预测，只保留未来的（> today_str）
             forward_peg = None
             fwd_growth = None
             if estimates and len(estimates) > 0 and price:
                 try:
                     estimates.sort(key=lambda x: x.get("date", "0000-00-00"))
-                    # 关键过滤：只看未来的预测
+                    # 只看未来数据
                     future = [e for e in estimates if e.get("date", "") > today_str]
                     if len(future) >= 2:
                         fy1, fy2 = future[0], future[1]
