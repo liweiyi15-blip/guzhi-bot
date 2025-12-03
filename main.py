@@ -285,7 +285,6 @@ class ValuationModel:
                     monthly_vol = estimated_vol_annual * math.sqrt(1/12)
                     var_95_pct = 1.65 * monthly_vol
                     
-                    # Fat Tail Adjustment
                     if beta > 1.5 or not is_profitable_strict:
                         var_95_pct *= 1.2
                     
@@ -549,8 +548,8 @@ class ValuationModel:
                 self.logs.append(f"[陷阱] PE ({format_num(pe_ttm)}) 虽低，但营收负增长，疑似周期顶部信号。")
             if beta and beta < 0.6: self.signals.add("LOW_VOLATILITY")
 
-            # === 4. 辩证策略生成 ===
-            self.construct_dialectical_strategy()
+            # === 4. 全谱扫描 + 辩证合成 ===
+            self.generate_holistic_strategy()
             
             self.short_term_verdict = self.get_short_term_verdict(ev_ebitda, sector_avg)
             self.long_term_verdict = self.get_long_term_verdict()
@@ -570,73 +569,65 @@ class ValuationModel:
             logger.error(traceback.format_exc())
             return None
 
-    # --- NEW: 辩证策略合成引擎 ---
-    def construct_dialectical_strategy(self):
+    # --- 全谱扫描 + 辩证合成引擎 ---
+    def generate_holistic_strategy(self):
         s = self.signals
-        parts = []
-        
-        # 1. 主基调 (Identity)
+        strategy_parts = []
+
+        # 1. 核心定性 (Identity)
         identity = ""
-        if "MEME_EXTREME" in s: identity = "【Meme/资金博弈】"
-        elif "BLUE_OCEAN" in s: identity = "【蓝海卡位】"
+        if "MEME_EXTREME" in s: identity = "【资金博弈】"
+        elif "BLUE_OCEAN" in s: identity = "【蓝海战略卡位】"
         elif "QUALITY_TOP_TIER" in s and ("CASHFLOW_RICH" in s or "CASHFLOW_HEALTHY" in s): identity = "【优质核心资产】"
         elif "QUALITY_TOP_TIER" in s and ("PEG_CHEAP" in s or "PEG_UNDERVALUED" in s): identity = "【成长型核心】"
-        elif "QUALITY_TOP_TIER" in s: identity = "【优质扩张】"
-        elif "DEEP_LOSS" in s and "DOWNTREND" in s: 
-            if "LOSS_NARROWING" in s or "TURNAROUND_PROFIT" in s:
-                identity = "【困境反转/左侧博弈】"
-            else:
-                identity = "【接飞刀风险】"
-        elif "VALUATION_CHEAP" in s and "CASHFLOW_RICH" in s: identity = "【深度价值】"
-        elif "PEG_CHEAP" in s or "PEG_UNDERVALUED" in s: identity = "【高性价比成长】"
-        elif "VALUATION_EXPENSIVE" in s and ("GROWTH_HIGH" in s or "GROWTH_HYPER" in s): identity = "【动量成长】"
-        else: identity = "【中性/观望】"
+        elif "DEEP_LOSS" in s and ("LOSS_NARROWING" in s or "TURNAROUND_PROFIT" in s): identity = "【困境反转博弈】"
+        elif "DEEP_LOSS" in s and "DOWNTREND" in s: identity = "【高风险/接飞刀】"
+        elif "VALUATION_CHEAP" in s: identity = "【深度价值】" if "CASHFLOW_RICH" in s else "【估值修复】"
+        elif "VALUATION_EXPENSIVE" in s: identity = "【动量成长】" if "GROWTH_HIGH" in s else "【估值泡沫】"
+        else: identity = "【中性观望】"
         
-        parts.append(identity)
+        strategy_parts.append(identity)
 
-        # 2. 正向/反向 辩证描述 (Dialectic)
-        desc = []
+        # 2. 辩证描述 (Dialectic Narrative)
+        # 这里不使用互斥逻辑，而是把所有显著特征都写出来
         
-        # 针对 RKLB/蓝海
-        if "BLUE_OCEAN" in s:
-            desc.append("处于前沿科技赛道，估值锚点在于远期的行业垄断地位。")
-            if "CASHFLOW_NEGATIVE" in s: desc.append("当前虽未盈利且估值极高，但这是行业早期特征。")
-            desc.append("短期波动极大，适合长线分批博弈。")
+        # 风险面 (Cons)
+        cons = []
+        if "DEEP_LOSS" in s: cons.append("深度亏损")
+        if "DOWNTREND" in s: cons.append("趋势向下")
+        if "CASHFLOW_NEGATIVE" in s and "BLUE_OCEAN" not in s: cons.append("现金流失血")
+        if "VALUATION_EXPENSIVE" in s and "GROWTH_LOW" in s: cons.append("估值透支")
+        if "VALUE_TRAP_RISK" in s: cons.append("营收萎缩")
         
-        # 针对 NIO/困境反转
-        elif "LOSS_NARROWING" in s or "TURNAROUND_PROFIT" in s:
-            desc.append("股价处于深跌趋势且深陷亏损（风险）。")
-            desc.append("但**亏损环比收窄**显示经营效率改善，具备困境反转的潜在赔率。")
-            desc.append("适合风险偏好极高的资金关注拐点。")
-        
-        # 针对 NVDA/高成长核心
-        elif "QUALITY_TOP_TIER" in s and ("PEG_CHEAP" in s or "PEG_UNDERVALUED" in s):
-            desc.append("既具备低PEG的强劲进攻性，又有顶级ROIC构建的深厚护城河。")
-            if "VALUATION_EXPENSIVE" in s: desc.append("虽然绝对估值有溢价，但完全被强劲的基本面消化。")
-            desc.append("属于‘大象狂奔’型机会，值得重仓。")
+        # 机会面 (Pros)
+        pros = []
+        if "QUALITY_TOP_TIER" in s: pros.append("资本效率(ROIC)顶级")
+        if "PEG_CHEAP" in s or "PEG_UNDERVALUED" in s: pros.append("PEG极低(高增长)")
+        if "LOSS_NARROWING" in s: pros.append("亏损环比收窄")
+        if "TURNAROUND_PROFIT" in s: pros.append("首次扭亏为盈")
+        if "BLUE_OCEAN" in s: pros.append("稀缺赛道卡位")
+        if "VALUATION_CHEAP" in s or "PS_LOW" in s: pros.append("估值处于低位")
+        if "CASHFLOW_RICH" in s: pros.append("造血能力强劲")
 
-        # 针对 NFLX/优质扩张
-        elif "QUALITY_TOP_TIER" in s and "CASHFLOW_NEGATIVE" in s:
-            desc.append("资本效率(ROIC)极高。现金流弱是因为正在进行高回报的再投入。")
-            desc.append("长期复利效应显著，不应单纯因现金流低而看空。")
+        # 3. 动态合成句子
+        if cons and pros:
+            # 这是一个矛盾体 (如 NIO, RKLB)
+            strategy_parts.append(f"虽然面临{'、'.join(cons)}的挑战（风险点），")
+            strategy_parts.append(f"但{'、'.join(pros)}显示基本面存在转机（机会点）。")
+            strategy_parts.append("当前价格隐含了较高的赔率，适合风险偏好较高的资金关注。")
+        elif cons and not pros:
+            # 纯烂
+            strategy_parts.append(f"当前面临{'、'.join(cons)}等多重利空，且缺乏明确的基本面支撑。")
+            strategy_parts.append("建议回避，等待右侧信号。")
+        elif not cons and pros:
+            # 纯好 (如 NVDA)
+            strategy_parts.append(f"具备{'、'.join(pros)}等核心优势，基本面强劲。")
+            strategy_parts.append("属于优质资产，值得长期配置。")
+        else:
+            # 平庸
+            strategy_parts.append("当前多空信号不明显，估值处于合理区间，建议观望。")
 
-        # 针对 垃圾股/接飞刀
-        elif "DEEP_LOSS" in s and "DOWNTREND" in s:
-            desc.append("深度亏损且股价处于下降趋势，基本面与技术面双杀。")
-            desc.append("缺乏明确的反转信号，建议回避，等待右侧机会。")
-
-        # 针对 泡沫
-        elif "VALUATION_EXPENSIVE" in s and "GROWTH_LOW" in s:
-            desc.append("估值昂贵且缺乏高增长支撑。")
-            desc.append("价格严重脱离基本面，存在回调风险。")
-
-        # 默认兜底描述
-        elif not desc:
-            if "VALUATION_CHEAP" in s: desc.append("当前估值具备安全边际。")
-            if "GROWTH_HIGH" in s: desc.append("增长动力强劲。")
-            if not desc: desc.append("多空信号不明显，建议观望。")
-
-        self.strategy = "".join(parts) + "".join(desc)
+        self.strategy = "".join(strategy_parts)
 
     def get_short_term_verdict(self, ev_ebitda, sector_avg):
         s = self.signals
