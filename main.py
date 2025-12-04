@@ -6,6 +6,7 @@ import os
 import asyncio
 import logging
 import json
+import math  # 新增 math 库用于 sqrt 计算
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional
@@ -25,7 +26,7 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 PRIVACY_MODE = {}
 
 # --- 白名单 ---
-HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN"]
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL"]
 
 # --- 关键词词典 ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
@@ -42,10 +43,12 @@ logger = logging.getLogger("ValuationBot")
 # --- 1. 异步数据工具函数 ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
+    # --- 日志脱敏处理 ---
+    safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
     try:
         async with session.get(url, timeout=10) as response:
             if response.status != 200:
-                logger.warning(f"API Status {response.status} for {url}")
+                logger.warning(f"API Status {response.status} for {safe_url}")
                 return None
             try:
                 data = await response.json()
@@ -55,6 +58,7 @@ async def get_json_safely(session: aiohttp.ClientSession, url: str):
                 return None
             return data
     except Exception:
+        logger.warning(f"Request failed for {safe_url}")
         return None
 
 async def get_treasury_rates(session: aiohttp.ClientSession):
@@ -72,7 +76,7 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
     data = await get_json_safely(session, url_profile)
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
-    
+     
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
@@ -428,11 +432,21 @@ class ValuationModel:
             
             if macro_status_log: self.logs.append(macro_status_log)
 
-            # --- VIX ---
-            vix = self.extract(vix_data, "price", "VIX", default=20)
-            if price and beta and vix:
-                monthly_risk_pct = (vix / 100) * beta * 1.0 * 100
-                self.risk_var = f"-{monthly_risk_pct:.1f}%"
+            # --- VIX & VaR (Scientific Update) ---
+            vix_val = self.extract(vix_data, "price", "VIX", default=20)
+            if price and beta and vix_val:
+                # 科学 VaR 计算 (Parametric Method)
+                # 1. 股票年化波动率 = VIX (市场年化) * Beta (假设单因子模型)
+                stock_annual_vol = (vix_val / 100.0) * beta
+                
+                # 2. 转换为月度波动率 (除以 sqrt(12))
+                stock_monthly_vol = stock_annual_vol / math.sqrt(12)
+                
+                # 3. 计算 95% Confidence Level 的单尾 VaR
+                # Z-score for 95% = 1.645
+                var_decimal = 1.645 * stock_monthly_vol
+                
+                self.risk_var = f"-{var_decimal * 100:.1f}%"
             
             # --- Meme ---
             meme_score = 0
@@ -580,6 +594,8 @@ class ValuationModel:
                     else: 
                         if peg_used < 0.8: peg_status = "低估"; peg_comment = "具备极高的安全边际。"
                         elif peg_used <= 1.5: peg_status = "合理"; peg_comment = "估值与增长匹配。"
+                        elif peg_used <= 3.0: peg_status = "溢价"; peg_comment = "估值偏高，包含较高预期。"
+                        else: peg_status = "高估"; peg_comment = "价格已透支未来增长，风险较高。"
                     self.logs.append(f"[成长锚点] PEG ({peg_type_str}): {peg_display} ({peg_status})。{peg_comment}")
                 elif peg_used is None:
                      self.logs.append(f"[成长锚点] PEG 数据缺失。")
