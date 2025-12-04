@@ -123,7 +123,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw
         "1. 字数严格限制在50字以内，简明扼要。"
         "2. 不能单靠一个pe得出结论，需要结合EV/EBITDA、PEG (Forward)、Adj FCF Yield、ROIC、PEG (TTM)等多种数据交叉验证，用华尔街看数据的方法，得出一个合理的评估结论，就像华尔街机构晨报那样， 语言风格要通俗易懂且专业。"
         "3. 用白话的形式告诉用户现在的股价是个什么位置（不要展示PEEV/EBITDA、PEG (Forward)、Adj FCF Yield、ROIC、PEG (TTM)数据），分析短期和长期有什么不同价值"
-        "4. 需要综合市场份额、行业地位、资本支出、市场竞争、行业趋势等因素做出理性判断。"
+        "4. 需要综合市场份额、行业地位、资本支出、行业趋势等因素做出理性判断。"
         "5. 不仅要看当下，更要用发展，向前看的视角对增长做出评估。"
         "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
