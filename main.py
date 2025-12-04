@@ -6,7 +6,7 @@ import os
 import asyncio
 import logging
 import json
-import math  # 新增 math 库用于 sqrt 计算
+import math
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional
@@ -128,7 +128,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw
         "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
 
-    # 将 raw_data 转换为 JSON 字符串，作为上下文
     try:
         data_context = json.dumps(raw_data, default=str)
     except Exception:
@@ -142,7 +141,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 1.3, # 稍微增加一点创造性
+        "temperature": 1.3, 
         "max_tokens": 100,
         "stream": False
     }
@@ -196,7 +195,7 @@ def get_sector_benchmark(sector):
 class ValuationModel:
     def __init__(self, ticker):
         self.ticker = ticker.upper()
-        self.data = {} # 这里存放全量原始数据
+        self.data = {} 
         self.short_term_verdict = "未知"
         self.long_term_verdict = "未知"
         self.market_regime = "未知"
@@ -237,7 +236,7 @@ class ValuationModel:
         }
         profile_data, treasury_data, *generic_results = await asyncio.gather(task_profile, task_treasury, *tasks_generic.values())
         
-        # 将结果存入 self.data，保持原始结构，DeepSeek 将使用这个字典
+        # 将结果存入 self.data
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
@@ -302,6 +301,9 @@ class ValuationModel:
             
             roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC", required=False)
             net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin", required=False)
+            # --- 新增：营业利润率提取 (用于更科学的盈利判定) ---
+            op_margin = self.extract(r, "operatingProfitMarginTTM", "Op Margin", required=False)
+
             ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S", required=False)
             
             peg_ttm = self.extract(r, "priceToEarningsGrowthRatioTTM", "PEG TTM", required=False)
@@ -328,7 +330,15 @@ class ValuationModel:
             else:
                 logger.info("[Earnings] No past earnings data found.")
 
-            is_profitable_strict = (eps_ttm is not None and eps_ttm > 0) and (latest_eps >= 0)
+            # --- 修改后的严格盈利判定逻辑 (针对 INTC 等) ---
+            # 只有当 EPS > 0 且 营业利润率 > 0 且 净利率 > 0 时，才算“盈利”。
+            # 这样可以排除掉靠税收抵扣/资产出售盈利但主营亏损的公司。
+            is_profitable_strict = (
+                (eps_ttm is not None and eps_ttm > 0) and 
+                (latest_eps >= 0) and 
+                (op_margin is not None and op_margin > 0) and 
+                (net_margin is not None and net_margin > 0)
+            )
             
             # 资产负债
             cash = self.extract(bs, "cashAndCashEquivalents", "Cash", required=False, default=0)
@@ -337,7 +347,7 @@ class ValuationModel:
 
             # 日志快照
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
-            logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)}")
+            logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)} | OpMargin: {format_percent(op_margin)}")
 
             # === 4. Forward PEG 计算 ===
             forward_peg = None
