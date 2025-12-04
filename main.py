@@ -5,6 +5,7 @@ import aiohttp
 import os
 import asyncio
 import logging
+import json
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional
@@ -14,9 +15,11 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 FMP_API_KEY = os.getenv('FMP_API_KEY')
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
 # *** 核心：全局唯一接口地址 (Stable) ***
 BASE_URL = "https://financialmodelingprep.com/stable"
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
@@ -102,6 +105,63 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
+# --- 2. DeepSeek AI 策略生成 ---
+
+async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw_data: dict):
+    if not DEEPSEEK_API_KEY:
+        return "DeepSeek API Key 未配置，无法生成智能策略。"
+
+    system_prompt = (
+        "你是一位拥有十年经验的资深美股交易员和华尔街机构分析师。你精通基本面分析、估值建模和市场情绪判断。"
+        "你需要阅读我提供的全量未经处理的原始财务数据（包括历史财报、实时行情、分析师预测、现金流等）。"
+        "请用**专业、科学、辩证**的角度评估这些数据。"
+        "**要求：**"
+        "1. 给出合理的评估结论，语言风格要通俗易懂且专业。"
+        "2. **严禁**给出具体的“买入”或“卖出”操作建议。"
+        "3. 字数严格限制在 **60个汉字以内**，简明扼要。"
+        "4. 不要罗列数据，直接给观点。"
+    )
+
+    # 将 raw_data 转换为 JSON 字符串，作为上下文
+    # 注意：raw_data 包含了 FMP 返回的所有原始字典结构
+    try:
+        data_context = json.dumps(raw_data, default=str)
+    except Exception:
+        data_context = "数据序列化失败"
+
+    user_prompt = f"股票代码：{ticker}。这是该股票全部的未经处理的原始API数据：\n{data_context}\n请根据上述数据生成一段策略评估。"
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 1.3, # 稍微增加一点创造性
+        "max_tokens": 100,
+        "stream": False
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+    }
+
+    try:
+        async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
+            if response.status == 200:
+                result = await response.json()
+                content = result['choices'][0]['message']['content']
+                return content.strip()
+            else:
+                logger.error(f"DeepSeek API Error: {response.status}")
+                return "AI 策略生成超时或失败，请参考上方因子分析。"
+    except Exception as e:
+        logger.error(f"DeepSeek Request Failed: {e}")
+        return "AI 连接中断。"
+
+# --- 3. 辅助格式化函数 ---
+
 def format_percent(num):
     return f"{num * 100:.2f}%" if num is not None and isinstance(num, (int, float)) else "N/A"
 
@@ -126,10 +186,12 @@ def get_sector_benchmark(sector):
         if key.lower() in str(sector).lower(): return SECTOR_EBITDA_MEDIAN[key]
     return 18.0
 
+# --- 4. 估值模型类 ---
+
 class ValuationModel:
     def __init__(self, ticker):
         self.ticker = ticker.upper()
-        self.data = {}
+        self.data = {} # 这里存放全量原始数据
         self.short_term_verdict = "未知"
         self.long_term_verdict = "未知"
         self.market_regime = "未知"
@@ -169,6 +231,8 @@ class ValuationModel:
             "estimates": get_estimates_data(session, self.ticker)
         }
         profile_data, treasury_data, *generic_results = await asyncio.gather(task_profile, task_treasury, *tasks_generic.values())
+        
+        # 将结果存入 self.data，保持原始结构，DeepSeek 将使用这个字典
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
@@ -754,6 +818,12 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         await interaction.followup.send(f"[Warning] 数据不足。", ephemeral=ephemeral_result)
         return
 
+    # *** AI 策略生成 (DeepSeek) ***
+    # 使用 AI 覆盖原本硬编码的 strategy
+    ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model.data)
+    if ai_strategy:
+        model.strategy = ai_strategy
+
     profit_label = "盈利" if data.get('is_profitable', False) else "亏损"
 
     embed = discord.Embed(
@@ -831,6 +901,8 @@ if __name__ == "__main__":
     else:
         if not FMP_API_KEY:
              logger.error("FMP_API_KEY environment variable not set.")
+        if not DEEPSEEK_API_KEY:
+             logger.warning("DEEPSEEK_API_KEY not set, AI features will be disabled.")
         try:
             bot.run(DISCORD_TOKEN)
         except Exception as e:
