@@ -122,7 +122,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw
         "4. 不仅要看当下，更要用发展，向前看的视角做出评估"
         "5. 字数严格限制在 **80个汉字以内**，简明扼要。"
         "6. 不要罗列数据，直接给观点。"
-        "7. 最后必须给一些持仓建议"
+        "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
 
     # 将 raw_data 转换为 JSON 字符串，作为上下文
