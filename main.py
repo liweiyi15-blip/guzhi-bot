@@ -126,7 +126,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, raw
     )
 
     # 将 raw_data 转换为 JSON 字符串，作为上下文
-    # 注意：raw_data 包含了 FMP 返回的所有原始字典结构
     try:
         data_context = json.dumps(raw_data, default=str)
     except Exception:
@@ -877,9 +876,11 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         else:
             formatted_logs.append(f"> {log}")
 
-    factor_str = "\n> \n".join(formatted_logs)
+    # 修改: 因子列表内部使用单换行符，避免列表项之间间距过大
+    factor_str = "\n".join(formatted_logs)
     strategy_text = f"**[策略]** {model.strategy}"
-    full_log_str = f"{factor_str}\n\n{strategy_text}"
+    # 修改: 因子列表与策略之间只使用单换行符，去除大间距
+    full_log_str = f"{factor_str}\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
 
