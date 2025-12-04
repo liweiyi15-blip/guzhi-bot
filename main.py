@@ -876,10 +876,10 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         else:
             formatted_logs.append(f"> {log}")
 
-    # 修改: 因子列表内部使用单换行符，避免列表项之间间距过大
-    factor_str = "\n".join(formatted_logs)
+    # 撤回修改: 恢复因子列表内部的空引用条间隔
+    factor_str = "\n> \n".join(formatted_logs)
     strategy_text = f"**[策略]** {model.strategy}"
-    # 修改: 因子列表与策略之间只使用单换行符，去除大间距
+    # 保持修改: 因子列表与策略之间只使用单换行符，防止间距过大
     full_log_str = f"{factor_str}\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
