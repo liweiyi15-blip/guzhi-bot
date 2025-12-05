@@ -11,8 +11,9 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional
 
-# --- 新增：引入 tenacity 用于重试机制 ---
-import tenacity
+# --- 外部库引入 ---
+import tenacity # 用于 DeepSeek 重试
+from cachetools import TTLCache # 用于 FMP 本地缓存
 
 # 加载环境变量
 load_dotenv()
@@ -28,9 +29,14 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 # --- 全局状态 ---
 PRIVACY_MODE = {}
 
-# --- 新增：全局并发信号量 (限制同时请求 DeepSeek 的数量为 3) ---
-# 防止瞬间并发过高导致 429 Too Many Requests 或 IP 封禁
+# --- 全局并发限制 (DeepSeek) ---
+# 限制同时请求 DeepSeek 的数量为 3，防止被封 IP
 DEEPSEEK_SEM = asyncio.Semaphore(3)
+
+# --- 全局缓存 (FMP) ---
+# maxsize=2000: 最多缓存2000个请求结果
+# ttl=600: 数据有效期 600秒 (10分钟)，期间重复查询不消耗 FMP 额度
+FMP_CACHE = TTLCache(maxsize=2000, ttl=600)
 
 # --- 白名单 ---
 HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL"]
@@ -47,11 +53,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 1. 异步数据工具函数 ---
+# --- 1. 异步数据工具函数 (含缓存逻辑) ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
+    # 1. 检查缓存
+    if url in FMP_CACHE:
+        # 命中缓存：直接返回，不打印日志以免刷屏，省钱！
+        return FMP_CACHE[url]
+
     # --- 日志脱敏处理 ---
     safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
+    
     try:
         async with session.get(url, timeout=10) as response:
             if response.status != 200:
@@ -61,8 +73,13 @@ async def get_json_safely(session: aiohttp.ClientSession, url: str):
                 data = await response.json()
             except Exception:
                 return None
+            
+            # FMP 有时会返回 {"Error Message": ...} 
             if isinstance(data, dict) and "Error Message" in data:
                 return None
+            
+            # 2. 写入缓存 (只有成功的数据才缓存)
+            FMP_CACHE[url] = data
             return data
     except Exception:
         logger.warning(f"Request failed for {safe_url}")
@@ -116,12 +133,8 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 (包含并发保护与重试机制) ---
+# --- 2. DeepSeek AI 策略生成 (稳如泰山版) ---
 
-# 使用 tenacity 装饰器：
-# stop=stop_after_attempt(3): 最多重试3次
-# wait=wait_exponential(...): 失败后等待时间指数增长 (2s, 4s, 8s...)
-# retry=retry_if_exception_type(...): 只有遇到网络错误或超时才重试，逻辑错误不重试
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
@@ -132,7 +145,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
     if not DEEPSEEK_API_KEY:
         return "DeepSeek API Key 未配置，无法生成智能策略。"
 
-    # --- 1. 数据精简与提取 ---
+    # --- 1. 数据提取 ---
     raw = model.data
     p = raw.get("profile", {}) or {}
     q = raw.get("quote", {}) or {}
@@ -143,7 +156,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
     estimates = raw.get("estimates", []) or []
     earnings = raw.get("earnings", []) or []
 
-    # 辅助：计算 Price Position
     price = p.get("price") or q.get("price") or 0
     high_52 = q.get("yearHigh", 0)
     low_52 = q.get("yearLow", 0)
@@ -153,7 +165,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
         else: pos_str = "Mid Range"
 
-    # 辅助：计算 PEG Forward (已修复逻辑：使用2年CAGR)
+    # 辅助：计算 PEG Forward (使用 2年 CAGR 修正版)
     peg_fwd_val = "N/A"
     try:
         if len(estimates) >= 2 and price:
@@ -162,21 +174,19 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             if len(future_ests) >= 2:
                 eps1 = future_ests[0].get("epsAvg")
                 eps2 = future_ests[1].get("epsAvg")
-                # 必须 eps1 > 0 且 eps2 > 0 才能做幂运算开根号
                 if eps1 and eps1 > 0 and eps2 and eps2 > 0:
                     fwd_pe = price / eps1
-                    # [修复] 使用 2年 CAGR: ((eps2/eps1)**0.5 - 1)
+                    # [修复] 2年 CAGR
                     fwd_growth = (eps2 / eps1) ** 0.5 - 1
                     if fwd_growth > 0:
                         peg_fwd_val = round(fwd_pe / (fwd_growth * 100), 2)
     except: pass
 
-    # 辅助：Earnings 格式化
     earnings_list = []
     if earnings:
         sorted_earning = sorted(earnings, key=lambda x: x.get("date", "0000-00-00"), reverse=True)[:4]
         for e in sorted_earning:
-            d = e.get("date", "")[:7] # YYYY-MM
+            d = e.get("date", "")[:7]
             rev = e.get("revenue", 0)
             rev_str = f"${rev/1e6:.1f}M" if rev else "N/A"
             eps_act = e.get("epsActual")
@@ -186,12 +196,10 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 beat_status = "Beat" if eps_act > eps_est else "Miss"
             earnings_list.append(f"{d} | Rev: {rev_str} | EPS: {beat_status}")
 
-    # 辅助：格式化函数
     def safe_fmt(val, is_pct=False):
         if val is None: return "N/A"
         return f"{val * 100:.2f}%" if is_pct else round(val, 2)
 
-    # *** 构建精简数据包 ***
     simplified_data = {
         "profile": {
             "symbol": p.get("symbol", ticker),
@@ -211,7 +219,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             "ev_ebitda": safe_fmt(r.get("enterpriseValueMultipleTTM") or m.get("enterpriseValueOverEBITDATTM")),
             "ps_ratio": safe_fmt(r.get("priceToSalesRatioTTM")),
             "peg_ttm": safe_fmt(r.get("priceToEarningsGrowthRatioTTM")),
-            "peg_forward": peg_fwd_val, # 使用修复后的 2y CAGR PEG
+            "peg_forward": peg_fwd_val,
             "pe_ttm": safe_fmt(r.get("priceToEarningsRatioTTM"))
         },
         "growth_efficiency": {
@@ -239,7 +247,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         }
     }
 
-    # --- 2. 准备请求 Payload ---
     system_prompt = (
         "你是一位拥有十年经验的资深美股交易员和华尔街机构分析师。你精通基本面分析、估值建模和市场情绪判断。"
         "你需要阅读我提供的精简财务数据包。"
@@ -276,8 +283,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
 
-    # --- 3. 发送请求 (使用信号量保护 + 自动重试) ---
-    async with DEEPSEEK_SEM: # 限制并发数
+    async with DEEPSEEK_SEM: # 并发保护
         try:
             async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
                 if response.status == 200:
@@ -286,14 +292,10 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                     return content.strip()
                 else:
                     logger.error(f"DeepSeek API Error: {response.status}")
-                    # 非200错误，如果不希望重试（如400 Bad Request），可以在这里直接返回
-                    # 但为了简单，这里让它通过外层的 ClientError 捕获或者直接返回错误信息
                     if 500 <= response.status < 600:
-                         # 抛出异常触发 tenacity 重试
                          raise aiohttp.ClientError(f"Server Error {response.status}")
                     return "AI 策略生成超时或失败，请参考上方因子分析。"
         except Exception as e:
-            # 抛出异常给 tenacity 捕获，进行重试
             logger.warning(f"DeepSeek Attempt Failed: {e}, retrying...")
             raise e
 
@@ -369,7 +371,6 @@ class ValuationModel:
         }
         profile_data, treasury_data, *generic_results = await asyncio.gather(task_profile, task_treasury, *tasks_generic.values())
         
-        # 将结果存入 self.data
         self.data = dict(zip(tasks_generic.keys(), generic_results))
         self.data["profile"] = profile_data 
         self.data["treasury"] = treasury_data 
@@ -397,6 +398,7 @@ class ValuationModel:
 
         total_endpoints = len(tasks_generic)
         failed_count = total_endpoints - len(success_keys)
+        # 如果大量使用缓存，这里会显示 API Success，但实际上可能并未发起真实网络请求，这是符合预期的
         logger.info(f"[API Status] Success: {len(success_keys)} | Failed: {failed_count} endpoints.")
         return self.data["profile"] is not None
 
@@ -434,7 +436,6 @@ class ValuationModel:
             
             roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC", required=False)
             net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin", required=False)
-            # --- 新增：营业利润率提取 (用于更科学的盈利判定) ---
             op_margin = self.extract(r, "operatingProfitMarginTTM", "Op Margin", required=False)
 
             ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S", required=False)
@@ -445,7 +446,7 @@ class ValuationModel:
             ni_growth = self.extract(g, "netIncomeGrowth", "NI Growth", required=False)
             rev_growth = self.extract(g, "revenueGrowth", "Rev Growth", required=False)
 
-            # 盈利检查 & 日志修复
+            # 盈利检查
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             latest_eps = 0
             
@@ -463,9 +464,6 @@ class ValuationModel:
             else:
                 logger.info("[Earnings] No past earnings data found.")
 
-            # --- 修改后的严格盈利判定逻辑 (针对 INTC 等) ---
-            # 只有当 EPS > 0 且 营业利润率 > 0 且 净利率 > 0 时，才算“盈利”。
-            # 这样可以排除掉靠税收抵扣/资产出售盈利但主营亏损的公司。
             is_profitable_strict = (
                 (eps_ttm is not None and eps_ttm > 0) and 
                 (latest_eps >= 0) and 
@@ -478,15 +476,12 @@ class ValuationModel:
             debt = self.extract(bs, "totalDebt", "Total Debt", required=False, default=0)
             is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
 
-            # 日志快照
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
-            logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)} | OpMargin: {format_percent(op_margin)}")
 
             # === 4. Forward PEG 计算 (修复版) ===
             forward_peg = None
             fwd_pe = None
             fwd_growth = None
-            eps_fy1_val = None 
             
             if estimates and len(estimates) > 0 and price:
                 try:
@@ -496,12 +491,10 @@ class ValuationModel:
                     if len(future_estimates) >= 2:
                         fy1 = future_estimates[0]; fy2 = future_estimates[1] 
                         eps_fy1 = fy1.get("epsAvg"); eps_fy2 = fy2.get("epsAvg")
-                        eps_fy1_val = eps_fy1 
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
-                            # [逻辑修复] 使用 2年 CAGR: ((eps2/eps1)**0.5 - 1)
-                            # 避免使用单年增长作为长期增长率导致 PEG 偏低
+                            # 2年 CAGR
                             fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
@@ -511,8 +504,6 @@ class ValuationModel:
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
             
-            logger.info(f"[PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
-
             # Growth Desc
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
             max_growth = max(growth_list) if growth_list else 0
@@ -547,8 +538,6 @@ class ValuationModel:
             if fcf_yield_used == fcf_yield_api:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
-            logger.info(f"[Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
-
             # --- 赛道识别 ---
             is_blue_ocean = False         
             is_hard_tech_growth = False 
@@ -577,10 +566,9 @@ class ValuationModel:
             
             if macro_status_log: self.logs.append(macro_status_log)
 
-            # --- VIX & VaR (Scientific Update) ---
+            # --- VIX & VaR ---
             vix_val = self.extract(vix_data, "price", "VIX", default=20)
             if price and beta and vix_val:
-                # 科学 VaR 计算 (Parametric Method)
                 stock_annual_vol = (vix_val / 100.0) * beta
                 stock_monthly_vol = stock_annual_vol / math.sqrt(12)
                 var_decimal = 1.645 * stock_monthly_vol
@@ -669,14 +657,12 @@ class ValuationModel:
                     if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 1.5):
                         st_status = "便宜 (高成长)"
                         self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg_used)}) 极低，属于越涨越便宜。")
-                        # 修复：NFLX Short Term 策略真空
                         if self.strategy == "数据不足":
                             self.strategy = "PEG极低且具备高成长属性，市场低估了其增长爆发力，属于极具性价比的进攻型标的。"
 
                     elif adjusted_ratio < 0.7:
                         st_status = "便宜"
                         self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
-                        # 修复：低估值但非高成长的策略真空
                         if self.strategy == "数据不足":
                             self.strategy = "当前估值显著低于行业平均水平，具备安全边际。建议关注是否有基本面改善的催化剂以修复估值。"
 
@@ -684,7 +670,6 @@ class ValuationModel:
                         if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 2.0):
                             st_status = "合理溢价"
                             self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
-                            # 修复：合理溢价的策略真空
                             if self.strategy == "数据不足":
                                 self.strategy = "高估值由高增长支撑，只要业绩增速维持，股价仍有上行空间，但需紧密跟踪财报。"
                         else:
@@ -802,7 +787,6 @@ class ValuationModel:
                         if fcf_yield_used < fcf_threshold and is_high_quality_growth and not is_faith_mode:
                             lt_status = "预期驱动/投资扩张"
                             self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
-                            # 修复：NFLX Long Term 策略真空
                             if self.strategy == "数据不足":
                                 self.strategy = "基本面强劲，当前处于高投入换高增长阶段。投资逻辑应侧重于未来的业绩释放能力，而非当下的现金流回报。"
                         elif fcf_yield_used < fcf_threshold and not is_high_quality_growth and not is_faith_mode:
@@ -810,7 +794,6 @@ class ValuationModel:
                             self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                             if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
                         
-                # 修复: 将 ROIC 逻辑从 FCF 的 elif 链条中解耦出来，改为独立 if
                 if roic and roic > 0.20 and (not is_faith_mode or (is_giant and meme_pct < 80)): 
                     lt_status = "优质/值得等待"
                     has_value_fix_log = any("[价值修正]" in x for x in self.logs)
@@ -819,8 +802,6 @@ class ValuationModel:
                     
                     if self.strategy == "数据不足" or "风险" in self.strategy or "高投入" in self.strategy:
                         is_peg_safe = peg_used is None or peg_used < 2.2 
-                        
-                        # 【逻辑升级】增加 FCF 门槛，区分“黄金窗口”与“优质扩张”
                         is_cash_flow_safe = adj_fcf_yield is not None and adj_fcf_yield > 0.015
 
                         if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
@@ -973,7 +954,6 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         await interaction.followup.send(f"[Warning] 数据不足。", ephemeral=ephemeral_result)
         return
 
-    # *** AI 策略生成 (DeepSeek) ***
     try:
         # 使用 AI 覆盖原本硬编码的 strategy
         ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
