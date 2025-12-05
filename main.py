@@ -109,13 +109,13 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 (已优化数据包) ---
+# --- 2. DeepSeek AI 策略生成 (已优化数据包 & PEG修复) ---
 
 async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, model):
     if not DEEPSEEK_API_KEY:
         return "DeepSeek API Key 未配置，无法生成智能策略。"
 
-    # --- 1. 数据精简与提取 (Construction of Simplified Packet) ---
+    # --- 1. 数据精简与提取 ---
     raw = model.data
     p = raw.get("profile", {}) or {}
     q = raw.get("quote", {}) or {}
@@ -136,7 +136,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
         else: pos_str = "Mid Range"
 
-    # 辅助：计算 PEG Forward (简单的复现逻辑)
+    # 辅助：计算 PEG Forward (修复逻辑：使用2年CAGR)
     peg_fwd_val = "N/A"
     try:
         if len(estimates) >= 2 and price:
@@ -145,9 +145,11 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             if len(future_ests) >= 2:
                 eps1 = future_ests[0].get("epsAvg")
                 eps2 = future_ests[1].get("epsAvg")
-                if eps1 and eps1 > 0 and eps2:
+                # 必须 eps1 > 0 且 eps2 > 0 才能做幂运算开根号
+                if eps1 and eps1 > 0 and eps2 and eps2 > 0:
                     fwd_pe = price / eps1
-                    growth = (eps2 - eps1) / eps1
+                    # [修复] 使用图片建议的公式: ((eps2/eps1)**0.5 - 1)
+                    growth = (eps2 / eps1) ** 0.5 - 1
                     if growth > 0:
                         peg_fwd_val = round(fwd_pe / (growth * 100), 2)
     except: pass
@@ -155,7 +157,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
     # 辅助：Earnings 格式化
     earnings_list = []
     if earnings:
-        # 按日期降序，取最近4次
         sorted_earning = sorted(earnings, key=lambda x: x.get("date", "0000-00-00"), reverse=True)[:4]
         for e in sorted_earning:
             d = e.get("date", "")[:7] # YYYY-MM
@@ -193,7 +194,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             "ev_ebitda": safe_fmt(r.get("enterpriseValueMultipleTTM") or m.get("enterpriseValueOverEBITDATTM")),
             "ps_ratio": safe_fmt(r.get("priceToSalesRatioTTM")),
             "peg_ttm": safe_fmt(r.get("priceToEarningsGrowthRatioTTM")),
-            "peg_forward": peg_fwd_val,
+            "peg_forward": peg_fwd_val, # 使用修复后的 2y CAGR PEG
             "pe_ttm": safe_fmt(r.get("priceToEarningsRatioTTM"))
         },
         "growth_efficiency": {
@@ -203,22 +204,18 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             "gross_margin": safe_fmt(r.get("grossProfitMarginTTM"), True)
         },
         "cash_flow_and_solvency": {
-            "adj_fcf_yield": model.fcf_yield_display, # 使用模型计算后的 Display 值
+            "adj_fcf_yield": model.fcf_yield_display,
             "total_cash": format_market_cap(bs.get("cashAndCashEquivalents")),
             "total_debt": format_market_cap(bs.get("totalDebt")),
             "net_cash_position": "Net Cash" if (bs.get("cashAndCashEquivalents", 0) or 0) > (bs.get("totalDebt", 0) or 0) else "Net Debt"
         },
         "shareholder_return": {
             "dividend_yield": safe_fmt(r.get("dividendYieldTTM"), True),
-            "shares_outstanding": format_market_cap(bs.get("commonStockSharesOutstanding")) # 简单替代 Trend，节省 Token
+            "shares_outstanding": format_market_cap(bs.get("commonStockSharesOutstanding"))
         },
         "earnings_trend_4q": earnings_list,
         "sentiment_factors": {
-            "meme_score": model.data.get("meme_pct", 0), # Analyze method sets this in data return, but simpler to calculate or grab from result if available. 
-            # 注意：Meme pct 是在 analyze() 返回的 dict 里，不在 model.data。
-            # 为了保持一致性，我们在 ask_deepseek_strategy 前已经跑过 analyze()
-            # 这里我们只能尽量取 model.flags 里的信息，或者重新计算。
-            # 为了简化，这里直接取 verdict 里的文字描述更有效。
+            "meme_score": model.data.get("meme_pct", 0),
             "risk_var_95": model.risk_var,
             "short_term_verdict": model.short_term_verdict,
             "long_term_verdict": model.long_term_verdict
@@ -460,7 +457,7 @@ class ValuationModel:
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
             logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)} | OpMargin: {format_percent(op_margin)}")
 
-            # === 4. Forward PEG 计算 ===
+            # === 4. Forward PEG 计算 (修复版) ===
             forward_peg = None
             fwd_pe = None
             fwd_growth = None
@@ -476,9 +473,11 @@ class ValuationModel:
                         eps_fy1 = fy1.get("epsAvg"); eps_fy2 = fy2.get("epsAvg")
                         eps_fy1_val = eps_fy1 
                         
-                        if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
+                        if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
-                            fwd_growth = (eps_fy2 - eps_fy1) / eps_fy1
+                            # [逻辑修复] 使用 2年 CAGR: ((eps2/eps1)**0.5 - 1)
+                            # 避免使用单年增长作为长期增长率导致 PEG 偏低
+                            fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
                 except Exception:
@@ -557,16 +556,9 @@ class ValuationModel:
             vix_val = self.extract(vix_data, "price", "VIX", default=20)
             if price and beta and vix_val:
                 # 科学 VaR 计算 (Parametric Method)
-                # 1. 股票年化波动率 = VIX (市场年化) * Beta (假设单因子模型)
                 stock_annual_vol = (vix_val / 100.0) * beta
-                
-                # 2. 转换为月度波动率 (除以 sqrt(12))
                 stock_monthly_vol = stock_annual_vol / math.sqrt(12)
-                
-                # 3. 计算 95% Confidence Level 的单尾 VaR
-                # Z-score for 95% = 1.645
                 var_decimal = 1.645 * stock_monthly_vol
-                
                 self.risk_var = f"-{var_decimal * 100:.1f}%"
             
             # --- Meme ---
@@ -958,7 +950,6 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
 
     # *** AI 策略生成 (DeepSeek) ***
     # 使用 AI 覆盖原本硬编码的 strategy
-    # 修改：传入 model 实例以便提取计算好的字段 (如 verdicts, adj_fcf 等)
     ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
     if ai_strategy:
         model.strategy = ai_strategy
@@ -1013,10 +1004,8 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         else:
             formatted_logs.append(f"> {log}")
 
-    # 撤回修改: 恢复因子列表内部的空引用条间隔
     factor_str = "\n> \n".join(formatted_logs)
     strategy_text = f"**[策略]** {model.strategy}"
-    # 保持修改: 因子列表与策略之间只使用单换行符，防止间距过大
     full_log_str = f"{factor_str}\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
