@@ -13,8 +13,8 @@ from typing import Optional, List, Tuple
 from collections import defaultdict
 
 # --- 外部库引入 ---
-import tenacity # 用于 DeepSeek 重试
-from cachetools import TTLCache # 用于 FMP 本地缓存
+import tenacity  # 用于 DeepSeek 重试
+from cachetools import TTLCache  # 用于 FMP 本地缓存
 
 # 加载环境变量
 load_dotenv()
@@ -35,8 +35,8 @@ PRIVACY_MODE = {}
 # ttl=600: 数据有效期 600秒 (10分钟)，期间重复查询不消耗 FMP 额度
 FMP_CACHE = TTLCache(maxsize=2000, ttl=600)
 
-# --- 白名单 (仅保留用于赛道识别，不再用于加分) ---
-HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL", "MSTR", "COIN"]
+# --- 白名单 ---
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL"]
 
 # --- 关键词词典 ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
@@ -50,7 +50,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 0. 限流模块 (个人限流) ---
+# --- 0. 限流模块 ---
+# 记录用户调用时间戳： user_id -> [timestamp1, timestamp2, ...]
 USER_CALLS = defaultdict(list)
 MAX_CALLS_PER_MIN = 6   # 个人每分钟最多6次
 MAX_CALLS_PER_HOUR = 60 # 每小时最多60次
@@ -59,7 +60,7 @@ def is_rate_limited(user_id: int) -> Tuple[bool, str]:
     now = datetime.now()
     user_history = USER_CALLS[user_id]
     
-    # 清理过期记录
+    # 清理过期记录 (只保留最近1小时的)
     valid_history = [t for t in user_history if t > now - timedelta(hours=1)]
     USER_CALLS[user_id] = valid_history
     
@@ -84,6 +85,7 @@ async def get_json_safely(session: aiohttp.ClientSession, url: str):
         return FMP_CACHE[url]
 
     # --- 日志脱敏处理 ---
+    # 即使 URL 里带 key，我们在打印日志时把它替换掉
     safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
     
     try:
@@ -155,11 +157,11 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 ---
+# --- 2. DeepSeek AI 策略生成 (稳如泰山版) ---
 
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_fixed(2),
+    wait=tenacity.wait_fixed(2), # 固定等待2秒，避免指数级等待太久导致Discord超时
     retry=tenacity.retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
     reraise=True 
 )
@@ -187,7 +189,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
         else: pos_str = "Mid Range"
 
-    # 辅助：计算 PEG Forward
+    # 辅助：计算 PEG Forward (使用 2年 CAGR 修正版)
     peg_fwd_val = "N/A"
     try:
         if len(estimates) >= 2 and price:
@@ -198,6 +200,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 eps2 = future_ests[1].get("epsAvg")
                 if eps1 and eps1 > 0 and eps2 and eps2 > 0:
                     fwd_pe = price / eps1
+                    # [修复] 2年 CAGR
                     fwd_growth = (eps2 / eps1) ** 0.5 - 1
                     if fwd_growth > 0:
                         peg_fwd_val = round(fwd_pe / (fwd_growth * 100), 2)
@@ -250,7 +253,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             "gross_margin": safe_fmt(r.get("grossProfitMarginTTM"), True)
         },
         "cash_flow_and_solvency": {
-            "adj_fcf_yield": model.fcf_yield_display, # 这里读取的是计算后的新 FCF Yield
+            "adj_fcf_yield": model.fcf_yield_display,
             "total_cash": format_market_cap(bs.get("cashAndCashEquivalents")),
             "total_debt": format_market_cap(bs.get("totalDebt")),
             "net_cash_position": "Net Cash" if (bs.get("cashAndCashEquivalents", 0) or 0) > (bs.get("totalDebt", 0) or 0) else "Net Debt"
@@ -261,8 +264,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         },
         "earnings_trend_4q": earnings_list,
         "sentiment_factors": {
-            "meme_score": f"{model.meme_pct}/100", # [重要] 传递更新后的Meme分给AI
-            "meme_analysis": "Meme值由换手率(资金活跃度)、RVOL(量比突变)、P/S(估值情绪)和均线乖离率综合计算得出。",
+            "meme_score": model.data.get("meme_pct", 0),
             "risk_var_95": model.risk_var,
             "short_term_verdict": model.short_term_verdict,
             "long_term_verdict": model.long_term_verdict
@@ -279,7 +281,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "3. 用白话的形式告诉用户现在的股价是个什么位置（不要展示PEEV/EBITDA、PEG (Forward)、Adj FCF Yield、ROIC、PEG (TTM)数据），分析短期和长期有什么不同价值"
         "4. 需要综合市场份额、行业地位、资本支出、行业趋势等因素做出理性判断。"
         "5. 不仅要看当下，更要用发展，向前看的视角对增长做出评估。"
-        "6. **高度关注情绪因子**：如果 'sentiment_factors' 中的 meme_score 极高（>80），说明当前该股处于量价齐升的资金狂热期（由高换手和高量比驱动），此时基本面估值可能暂时失效，请在建议中重点提示波动风险和动量机会。"
         "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
 
@@ -297,7 +298,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 1.3, 
-        "max_tokens": 150,
+        "max_tokens": 100,
         "stream": False
     }
 
@@ -306,6 +307,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
 
+    # 使用传入的 semaphore
     async with semaphore: 
         try:
             async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
@@ -362,8 +364,7 @@ class ValuationModel:
         self.flags = []  
         self.strategy = "数据不足"  
         self.fcf_yield_display = "N/A" 
-        self.fcf_yield_api = None
-        self.meme_pct = 0 # [新增] 用于存储计算后的加权 Meme 分数
+        self.fcf_yield_api = None 
 
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
@@ -444,13 +445,10 @@ class ValuationModel:
             # === 1. 基础数据 ===
             price = self.extract(q, "price", "Quote Price", default=p.get("price"))
             price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
-            low_52 = self.extract(q, "yearLow", "52W Low", required=False)
             sector = self.extract(p, "sector", "Sector", default="Unknown")
             industry = self.extract(p, "industry", "Industry", default="Unknown")
             beta = self.extract(p, "beta", "Beta", default=1.0)
             m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
-            # [新增] 提前获取流通股数，用于 Meme 计算
-            shares_out = self.extract(bs, "commonStockSharesOutstanding", "Shares", required=False)
             
             # === 2. 财务指标 ===
             ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA", required=False)
@@ -486,7 +484,10 @@ class ValuationModel:
                 latest_q = sorted_earnings_for_check[0]
                 val = latest_q.get("epsActual")
                 latest_eps = val if val is not None else 0
-            
+                logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {val}")
+            else:
+                logger.info("[Earnings] No past earnings data found.")
+
             is_profitable_strict = (
                 (eps_ttm is not None and eps_ttm > 0) and 
                 (latest_eps >= 0) and 
@@ -501,7 +502,7 @@ class ValuationModel:
 
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
 
-            # === 4. Forward PEG 计算 ===
+            # === 4. Forward PEG 计算 (修复版) ===
             forward_peg = None
             fwd_pe = None
             fwd_growth = None
@@ -517,6 +518,7 @@ class ValuationModel:
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
+                            # 2年 CAGR
                             fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
@@ -535,7 +537,7 @@ class ValuationModel:
             elif max_growth > 0.05: growth_desc = "稳健"
             if peg_used and peg_used > 3.0: growth_desc = "高预期"
             
-            # === 5. Adjusted FCF Yield (New Logic) ===
+            # === 5. Adjusted FCF Yield ===
             adj_fcf_yield = None
             if len(cf_list) >= 4 and m_cap and m_cap > 0:
                 ttm_cfo = 0
@@ -550,12 +552,7 @@ class ValuationModel:
                         quarter_count += 1
                     else: break 
                 if ttm_cfo != 0 and quarter_count >= 4:
-                    # [新逻辑] 动态维护性资本开支比例
-                    if rev_growth is not None and rev_growth > 0.15:
-                        MAINTENANCE_CAPEX_RATIO = 0.3
-                    else:
-                        MAINTENANCE_CAPEX_RATIO = 0.8
-                        
+                    MAINTENANCE_CAPEX_RATIO = 0.5 
                     maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
                     adj_fcf = ttm_cfo - maintenance_capex
                     adj_fcf_yield = adj_fcf / m_cap
@@ -601,63 +598,60 @@ class ValuationModel:
                 var_decimal = 1.645 * stock_monthly_vol
                 self.risk_var = f"-{var_decimal * 100:.1f}%"
             
-            # --- Meme Score (Scientific v3.0) ---
-            # [核心修改] 移除白名单暴击，采用纯数据驱动
+            # --- Meme (NEW - Based on Image) ---
             meme_score = 0
             vol_today = self.extract(q, "volume", "Volume", required=False)
-            vol_avg = self.extract(q, "avgVolume", "Avg Vol", required=False)
-            # shares_out 已在上方提取
+            vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
 
-            # 1. 换手率 (Turnover) - 基础热度 (权重: 35)
-            # 科学依据: 换手率是衡量散户参与度最直接的指标。
-            if vol_today and shares_out and shares_out > 0:
-                turnover = vol_today / shares_out
-                # 换手率 1% = 2.5分。
-                # TSLA 常态 3%-5% -> 7.5-12.5分
-                # 爆炒股 15% -> 37.5分 (封顶 35)
-                score_turnover = min(turnover * 100 * 2.5, 35)
-                meme_score += score_turnover
+            # 1. 价格动量
+            if price and price_200ma:
+                if price > price_200ma * 1.4: 
+                    meme_score += 2
+                elif price > price_200ma * 1.15: 
+                    meme_score += 1
+
+            # 2. 估值炒作 (PS 或 EV/EBITDA 过高)
+            ps_val = ps_ratio if ps_ratio is not None else 0
+            evebitda_val = ev_ebitda if ev_ebitda is not None else 0
             
-            # 2. 量比 (Relative Volume, RVOL) - 突发热度 (权重: 25)
-            # 科学依据: 只有成交量显著放大(RVOL > 1.5)，才说明有突发资金进场。
-            if vol_today and vol_avg and vol_avg > 0:
-                rvol = vol_today / vol_avg
-                # RVOL < 1.0 : 0分
-                # RVOL 1.5 : 10分
-                # RVOL 3.0 : 25分 (满分)
-                if rvol > 1.0:
-                    score_rvol = min((rvol - 1.0) * 12.5, 25)
-                    meme_score += score_rvol
-
-            # 3. 估值泡沫度 (P/S) - 想象力溢价 (权重: 20)
-            # 科学依据: 高P/S意味着脱离引力，纯靠情绪和故事驱动。
-            if ps_ratio:
-                # P/S 10 -> 10分
-                # P/S 20 -> 20分
-                score_ps = min(ps_ratio, 20)
-                meme_score += score_ps
-
-            # 4. 波动率 (Beta) - 投机属性 (权重: 10)
+            if (ps_val > 20) or (evebitda_val > 80): 
+                meme_score += 4
+            elif (ps_val > 10) or (evebitda_val > 40): 
+                meme_score += 2
+            elif (ps_val > 8) or (evebitda_val > 30): 
+                meme_score += 1
+            
+            # 3. 波动率 (Beta)
             if beta:
-                # Beta 1.0 -> 0分
-                # Beta 2.0 -> 10分
-                score_beta = max((beta - 1.0) * 10, 0)
-                meme_score += min(score_beta, 10)
+                if beta > 2.0: 
+                    meme_score += 2
+                elif beta > 1.3: 
+                    meme_score += 1
 
-            # 5. 技术乖离率 (Price vs MA200) - 趋势强度 (权重: 10)
-            # 科学依据: 只有价格在均线之上且远离均线，才叫主升浪。
-            if price and price_200ma and price_200ma > 0:
-                bias = (price / price_200ma) - 1
-                if bias > 0:
-                     # 偏离 20% -> 5分
-                     # 偏离 40% -> 10分
-                     score_bias = min(bias * 25, 10)
-                     meme_score += score_bias
-
-            # 归一化 (允许稍微溢出后截断)
-            meme_pct = int(min(meme_score, 100)) 
-            self.meme_pct = meme_pct 
-            is_faith_mode = meme_pct >= 60
+            # 4. 基本面背离 (价格高企但基本面差)
+            if price and price_200ma and price > price_200ma:
+                bad_fcf = (fcf_yield_api is not None and fcf_yield_api < 0.01)
+                bad_peg = (peg_used is not None and (peg_used < 0 or peg_used > 4.0))
+                
+                if bad_fcf or bad_peg: 
+                    meme_score += 2
+            
+            # 5. 成交量异动
+            if vol_today and vol_avg and vol_avg > 0:
+                if vol_today > vol_avg * 1.2: 
+                    meme_score += 1
+            
+            # 6. 质量折扣 (高ROIC且PEG合理则减分)
+            if roic and roic > 0.20:
+                if peg_used and 0 < peg_used < 3.0: 
+                    meme_score -= 3
+                else: 
+                    meme_score -= 1
+            
+            # 7. 归一化与信仰模式
+            meme_score = max(0, min(10, meme_score))
+            meme_pct = int(meme_score * 10)
+            is_faith_mode = meme_pct >= 50
 
             # === 9. 估值与策略判定 ===
             sector_avg = get_sector_benchmark(sector)
@@ -788,18 +782,20 @@ class ValuationModel:
                 # Meme
                 if is_faith_mode:
                     meme_log = ""
-                    meme_strategy_text = "资金情绪极度亢奋，基本面估值已失效，交易决策建议跟随趋势指标（如RSI或均线）。"
-                    if 60 <= meme_pct < 70:
+                    meme_strategy_text = "价格波动性可能增加，交易决策可以结合市场动量指标。"
+                    if 50 <= meme_pct < 60:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
+                    elif 60 <= meme_pct < 70:
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪高度活跃，体现出显著的**资金共识**和高流动性。"
                     elif 70 <= meme_pct < 80:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，价格由流动性驱动，存在明显的**溢价**。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，公司获得大量**关注溢价**，价格驱动力强劲。"
                     elif 80 <= meme_pct < 90:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场进入狂热阶段，基本面因子失效，**资金博弈**成为主导。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪已进入非理性繁荣区间，价格体现出**极致的资金动能**。"
                     elif meme_pct >= 90:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。**极致的逼空行情**，情绪见顶，波动风险极大。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪处于顶峰，反映出**极强的短期向上动量**。"
                     
                     if is_giant and meme_pct < 80:
-                         if meme_log: self.logs.insert(0, meme_log)
+                        if meme_log: self.logs.insert(0, meme_log)
                     else:
                         if meme_log: self.logs.insert(0, meme_log)
                         if "昂贵" in st_status: st_status += " / 资金动量"
@@ -961,6 +957,7 @@ class AnalysisBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
+        # 将信号量移入类中，防止全局变量污染
         self.deepseek_sem = asyncio.Semaphore(3)
 
     async def setup_hook(self):
@@ -1020,6 +1017,8 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         return
 
     try:
+        # 使用 AI 覆盖原本硬编码的 strategy
+        # 传入 bot.deepseek_sem
         ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model, interaction.client.deepseek_sem)
         if ai_strategy:
             model.strategy = ai_strategy
