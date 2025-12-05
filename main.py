@@ -50,8 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
-# --- 0. 限流模块 (新增) ---
-# 记录用户调用时间戳： user_id -> [timestamp1, timestamp2, ...]
+# --- 0. 限流模块 (个人限流) ---
 USER_CALLS = defaultdict(list)
 MAX_CALLS_PER_MIN = 6   # 个人每分钟最多6次
 MAX_CALLS_PER_HOUR = 60 # 每小时最多60次
@@ -60,7 +59,7 @@ def is_rate_limited(user_id: int) -> Tuple[bool, str]:
     now = datetime.now()
     user_history = USER_CALLS[user_id]
     
-    # 清理过期记录 (只保留最近1小时的)
+    # 清理过期记录
     valid_history = [t for t in user_history if t > now - timedelta(hours=1)]
     USER_CALLS[user_id] = valid_history
     
@@ -85,7 +84,6 @@ async def get_json_safely(session: aiohttp.ClientSession, url: str):
         return FMP_CACHE[url]
 
     # --- 日志脱敏处理 ---
-    # 即使 URL 里带 key，我们在打印日志时把它替换掉
     safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
     
     try:
@@ -157,11 +155,11 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 (稳如泰山版) ---
+# --- 2. DeepSeek AI 策略生成 ---
 
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_fixed(2), # 固定等待2秒，避免指数级等待太久导致Discord超时
+    wait=tenacity.wait_fixed(2),
     retry=tenacity.retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
     reraise=True 
 )
@@ -189,7 +187,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
         else: pos_str = "Mid Range"
 
-    # 辅助：计算 PEG Forward (使用 2年 CAGR 修正版)
+    # 辅助：计算 PEG Forward
     peg_fwd_val = "N/A"
     try:
         if len(estimates) >= 2 and price:
@@ -200,7 +198,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 eps2 = future_ests[1].get("epsAvg")
                 if eps1 and eps1 > 0 and eps2 and eps2 > 0:
                     fwd_pe = price / eps1
-                    # [修复] 2年 CAGR
                     fwd_growth = (eps2 / eps1) ** 0.5 - 1
                     if fwd_growth > 0:
                         peg_fwd_val = round(fwd_pe / (fwd_growth * 100), 2)
@@ -307,7 +304,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
 
-    # 使用传入的 semaphore
     async with semaphore: 
         try:
             async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
@@ -484,10 +480,7 @@ class ValuationModel:
                 latest_q = sorted_earnings_for_check[0]
                 val = latest_q.get("epsActual")
                 latest_eps = val if val is not None else 0
-                logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {val}")
-            else:
-                logger.info("[Earnings] No past earnings data found.")
-
+            
             is_profitable_strict = (
                 (eps_ttm is not None and eps_ttm > 0) and 
                 (latest_eps >= 0) and 
@@ -502,7 +495,7 @@ class ValuationModel:
 
             logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
 
-            # === 4. Forward PEG 计算 (修复版) ===
+            # === 4. Forward PEG 计算 ===
             forward_peg = None
             fwd_pe = None
             fwd_growth = None
@@ -518,7 +511,6 @@ class ValuationModel:
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
-                            # 2年 CAGR
                             fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
@@ -537,7 +529,7 @@ class ValuationModel:
             elif max_growth > 0.05: growth_desc = "稳健"
             if peg_used and peg_used > 3.0: growth_desc = "高预期"
             
-            # === 5. Adjusted FCF Yield ===
+            # === 5. Adjusted FCF Yield (Logic Upgraded) ===
             adj_fcf_yield = None
             if len(cf_list) >= 4 and m_cap and m_cap > 0:
                 ttm_cfo = 0
@@ -552,7 +544,14 @@ class ValuationModel:
                         quarter_count += 1
                     else: break 
                 if ttm_cfo != 0 and quarter_count >= 4:
-                    MAINTENANCE_CAPEX_RATIO = 0.5 
+                    # [新逻辑] 动态维护性资本开支比例
+                    # 如果营收增速 > 15%，认为是成长型公司，维护性CapEx较低 (0.3)
+                    # 否则认为是成熟/低速公司，维护性CapEx较高 (0.8)
+                    if rev_growth is not None and rev_growth > 0.15:
+                        MAINTENANCE_CAPEX_RATIO = 0.3
+                    else:
+                        MAINTENANCE_CAPEX_RATIO = 0.8
+                        
                     maintenance_capex = ttm_dep_amort * MAINTENANCE_CAPEX_RATIO
                     adj_fcf = ttm_cfo - maintenance_capex
                     adj_fcf_yield = adj_fcf / m_cap
@@ -598,29 +597,35 @@ class ValuationModel:
                 var_decimal = 1.645 * stock_monthly_vol
                 self.risk_var = f"-{var_decimal * 100:.1f}%"
             
-            # --- Meme ---
+            # --- Meme Score (Weighted Logic Upgrade) ---
             meme_score = 0
             vol_today = self.extract(q, "volume", "Volume", required=False)
             vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
-            if price and price_200ma:
-                if price > price_200ma * 1.4: meme_score += 2
-                elif price > price_200ma * 1.15: meme_score += 1
-            if (ps_ratio and ps_ratio > 20) or (ev_ebitda and ev_ebitda > 80): meme_score += 4
-            elif (ps_ratio and ps_ratio > 10) or (ev_ebitda and ev_ebitda > 40): meme_score += 2
-            elif (ps_ratio and ps_ratio > 8) or (ev_ebitda and ev_ebitda > 30): meme_score += 1
-            if beta > 2.0: meme_score += 2
-            elif beta > 1.3: meme_score += 1
-            if price and price_200ma and price > price_200ma:
-                bad_fcf = (fcf_yield_api is not None and fcf_yield_api < 0.01)
-                bad_peg = (peg_used is not None and (peg_used < 0 or peg_used > 4.0))
-                if bad_fcf or bad_peg: meme_score += 2
+            
+            # 1. 价格偏离度 (max 30分)
+            if price and price_200ma and price_200ma > 0:
+                deviation = (price / price_200ma) - 1
+                score_part = max(deviation * 30, 0) # 只有正偏离才加分
+                meme_score += min(score_part, 30)
+                
+            # 2. P/S 估值热度 (max 30分)
+            if ps_ratio:
+                score_part = ps_ratio / 2.0
+                meme_score += min(score_part, 30)
+                
+            # 3. 超额 Beta (max 20分)
+            if beta:
+                score_part = max((beta - 1) * 20, 0)
+                meme_score += min(score_part, 20)
+                
+            # 4. 成交量异动 (20分)
             if vol_today and vol_avg and vol_avg > 0:
-                if vol_today > vol_avg * 1.2: meme_score += 1
-            if roic and roic > 0.20:
-                if peg_used and 0 < peg_used < 3.0: meme_score -= 3
-                else: meme_score -= 1
-            meme_score = max(0, min(10, meme_score))
-            meme_pct = int(meme_score * 10)
+                if vol_today > vol_avg * 3: # 3倍量爆炸
+                    meme_score += 20
+                elif vol_today > vol_avg * 1.5:
+                    meme_score += 10
+                    
+            meme_pct = int(min(meme_score, 100)) # 归一化到 0-100
             is_faith_mode = meme_pct >= 50
 
             # === 9. 估值与策略判定 ===
@@ -927,7 +932,6 @@ class AnalysisBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
-        # 将信号量移入类中，防止全局变量污染
         self.deepseek_sem = asyncio.Semaphore(3)
 
     async def setup_hook(self):
@@ -987,8 +991,6 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         return
 
     try:
-        # 使用 AI 覆盖原本硬编码的 strategy
-        # 传入 bot.deepseek_sem
         ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model, interaction.client.deepseek_sem)
         if ai_strategy:
             model.strategy = ai_strategy
