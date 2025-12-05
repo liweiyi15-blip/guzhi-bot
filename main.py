@@ -28,7 +28,6 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
-CURRENT_MODEL = "deepseek-chat" # 默认模型，可通过 /model 命令切换
 
 # --- 全局并发限制 (DeepSeek) ---
 # 限制同时请求 DeepSeek 的数量为 3，防止被封 IP
@@ -59,15 +58,13 @@ logger = logging.getLogger("ValuationBot")
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
     # 1. 检查缓存
     if url in FMP_CACHE:
-        # [日志恢复] 即使命中缓存也打印日志，以便你在 Railway 上看到详细流程
-        logger.info(f"[Cache Hit] Using cached data for: {url.split('?')[0]}...") 
+        # 命中缓存：直接返回，不打印日志以免刷屏，省钱！
         return FMP_CACHE[url]
 
     # --- 日志脱敏处理 ---
     safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
     
     try:
-        logger.info(f"[API Request] Fetching: {safe_url}") # [日志恢复] 打印请求日志
         async with session.get(url, timeout=10) as response:
             if response.status != 200:
                 logger.warning(f"API Status {response.status} for {safe_url}")
@@ -270,9 +267,8 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
 
     user_prompt = f"股票代码：{ticker}。这是该股票的精简API数据：\n{data_context}\n请根据上述数据生成一段策略评估。"
 
-    # [改动] 使用全局变量 CURRENT_MODEL
     payload = {
-        "model": CURRENT_MODEL, 
+        "model": "deepseek-chat",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -289,7 +285,6 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
 
     async with DEEPSEEK_SEM: # 并发保护
         try:
-            logger.info(f"[DeepSeek] Sending Request... Model: {CURRENT_MODEL}") # 打印正在使用的模型
             async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -298,7 +293,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 else:
                     logger.error(f"DeepSeek API Error: {response.status}")
                     if 500 <= response.status < 600:
-                          raise aiohttp.ClientError(f"Server Error {response.status}")
+                         raise aiohttp.ClientError(f"Server Error {response.status}")
                     return "AI 策略生成超时或失败，请参考上方因子分析。"
         except Exception as e:
             logger.warning(f"DeepSeek Attempt Failed: {e}, retrying...")
@@ -544,7 +539,7 @@ class ValuationModel:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
             # --- 赛道识别 ---
-            is_blue_ocean = False          
+            is_blue_ocean = False         
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
@@ -931,17 +926,6 @@ async def privacy(interaction: discord.Interaction):
     status = "已开启 (查询结果仅自己可见)" if new_state else "已关闭 (查询结果公开)"
     await interaction.response.send_message(f"[Info] 隐私模式切换成功。\n当前状态: **{status}**", ephemeral=True)
 
-# [新增命令] 切换 DeepSeek 模型
-@bot.tree.command(name="model", description="切换 DeepSeek 模型 (deepseek-chat / deepseek-reasoner)")
-@app_commands.choices(model=[
-    app_commands.Choice(name="DeepSeek Chat (V3)", value="deepseek-chat"),
-    app_commands.Choice(name="DeepSeek Reasoner (R1)", value="deepseek-reasoner")
-])
-async def switch_model(interaction: discord.Interaction, model: app_commands.Choice[str]):
-    global CURRENT_MODEL
-    CURRENT_MODEL = model.value
-    await interaction.response.send_message(f"✅ 模型已切换为: **{model.name}**", ephemeral=True)
-
 async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
     is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
     ephemeral_result = is_privacy_mode
@@ -1036,7 +1020,7 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
 
     embed.add_field(name="因子分析", value=full_log_str, inline=False)
-    embed.set_footer(text=f"(模型: {CURRENT_MODEL}, 仅作参考)")
+    embed.set_footer(text="(模型建议，仅作参考，不构成投资建议)")
 
     await interaction.followup.send(embed=embed, ephemeral=ephemeral_result)
 
