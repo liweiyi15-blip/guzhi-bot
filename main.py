@@ -76,7 +76,7 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
     data = await get_json_safely(session, url_profile)
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
-     
+      
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
@@ -109,18 +109,126 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 (已精简数据包) ---
+# --- 2. DeepSeek AI 策略生成 (已优化数据包) ---
 
-async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, summary_data: dict):
-    """
-    修改点：接收经过清洗的 summary_data，而非 raw_data
-    """
+async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, model):
     if not DEEPSEEK_API_KEY:
         return "DeepSeek API Key 未配置，无法生成智能策略。"
 
+    # --- 1. 数据精简与提取 (Construction of Simplified Packet) ---
+    raw = model.data
+    p = raw.get("profile", {}) or {}
+    q = raw.get("quote", {}) or {}
+    r = raw.get("ratios", {}) or {}
+    m = raw.get("metrics", {}) or {}
+    g = raw.get("growth", {}) or {}
+    bs = raw.get("bs", {}) or {}
+    estimates = raw.get("estimates", []) or []
+    earnings = raw.get("earnings", []) or []
+
+    # 辅助：计算 Price Position
+    price = p.get("price") or q.get("price") or 0
+    high_52 = q.get("yearHigh", 0)
+    low_52 = q.get("yearLow", 0)
+    pos_str = "N/A"
+    if high_52 and low_52 and price:
+        if price >= high_52 * 0.95: pos_str = "Near All-Time High"
+        elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
+        else: pos_str = "Mid Range"
+
+    # 辅助：计算 PEG Forward (简单的复现逻辑)
+    peg_fwd_val = "N/A"
+    try:
+        if len(estimates) >= 2 and price:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            future_ests = sorted([e for e in estimates if e.get("date") > today_str], key=lambda x: x.get("date"))
+            if len(future_ests) >= 2:
+                eps1 = future_ests[0].get("epsAvg")
+                eps2 = future_ests[1].get("epsAvg")
+                if eps1 and eps1 > 0 and eps2:
+                    fwd_pe = price / eps1
+                    growth = (eps2 - eps1) / eps1
+                    if growth > 0:
+                        peg_fwd_val = round(fwd_pe / (growth * 100), 2)
+    except: pass
+
+    # 辅助：Earnings 格式化
+    earnings_list = []
+    if earnings:
+        # 按日期降序，取最近4次
+        sorted_earning = sorted(earnings, key=lambda x: x.get("date", "0000-00-00"), reverse=True)[:4]
+        for e in sorted_earning:
+            d = e.get("date", "")[:7] # YYYY-MM
+            rev = e.get("revenue", 0)
+            rev_str = f"${rev/1e6:.1f}M" if rev else "N/A"
+            eps_act = e.get("epsActual")
+            eps_est = e.get("epsEstimated")
+            beat_status = "Mix"
+            if eps_act is not None and eps_est is not None:
+                beat_status = "Beat" if eps_act > eps_est else "Miss"
+            earnings_list.append(f"{d} | Rev: {rev_str} | EPS: {beat_status}")
+
+    # 辅助：格式化函数
+    def safe_fmt(val, is_pct=False):
+        if val is None: return "N/A"
+        return f"{val * 100:.2f}%" if is_pct else round(val, 2)
+
+    # *** 构建精简数据包 ***
+    simplified_data = {
+        "profile": {
+            "symbol": p.get("symbol", ticker),
+            "price": price,
+            "market_cap": format_market_cap(p.get("mktCap")),
+            "sector": p.get("sector", "N/A"),
+            "industry": p.get("industry", "N/A"),
+            "beta": p.get("beta", "N/A")
+        },
+        "price_context": {
+            "current_price": price,
+            "range_52w_low": low_52,
+            "range_52w_high": high_52,
+            "position": pos_str
+        },
+        "valuation_ratios": {
+            "ev_ebitda": safe_fmt(r.get("enterpriseValueMultipleTTM") or m.get("enterpriseValueOverEBITDATTM")),
+            "ps_ratio": safe_fmt(r.get("priceToSalesRatioTTM")),
+            "peg_ttm": safe_fmt(r.get("priceToEarningsGrowthRatioTTM")),
+            "peg_forward": peg_fwd_val,
+            "pe_ttm": safe_fmt(r.get("priceToEarningsRatioTTM"))
+        },
+        "growth_efficiency": {
+            "revenue_growth_ttm": safe_fmt(g.get("revenueGrowth"), True),
+            "roic": safe_fmt(m.get("returnOnInvestedCapitalTTM"), True),
+            "net_margin": safe_fmt(r.get("netProfitMarginTTM"), True),
+            "gross_margin": safe_fmt(r.get("grossProfitMarginTTM"), True)
+        },
+        "cash_flow_and_solvency": {
+            "adj_fcf_yield": model.fcf_yield_display, # 使用模型计算后的 Display 值
+            "total_cash": format_market_cap(bs.get("cashAndCashEquivalents")),
+            "total_debt": format_market_cap(bs.get("totalDebt")),
+            "net_cash_position": "Net Cash" if (bs.get("cashAndCashEquivalents", 0) or 0) > (bs.get("totalDebt", 0) or 0) else "Net Debt"
+        },
+        "shareholder_return": {
+            "dividend_yield": safe_fmt(r.get("dividendYieldTTM"), True),
+            "shares_outstanding": format_market_cap(bs.get("commonStockSharesOutstanding")) # 简单替代 Trend，节省 Token
+        },
+        "earnings_trend_4q": earnings_list,
+        "sentiment_factors": {
+            "meme_score": model.data.get("meme_pct", 0), # Analyze method sets this in data return, but simpler to calculate or grab from result if available. 
+            # 注意：Meme pct 是在 analyze() 返回的 dict 里，不在 model.data。
+            # 为了保持一致性，我们在 ask_deepseek_strategy 前已经跑过 analyze()
+            # 这里我们只能尽量取 model.flags 里的信息，或者重新计算。
+            # 为了简化，这里直接取 verdict 里的文字描述更有效。
+            "risk_var_95": model.risk_var,
+            "short_term_verdict": model.short_term_verdict,
+            "long_term_verdict": model.long_term_verdict
+        }
+    }
+
+    # --- 2. 发送请求 ---
     system_prompt = (
         "你是一位拥有十年经验的资深美股交易员和华尔街机构分析师。你精通基本面分析、估值建模和市场情绪判断。"
-        "你需要阅读我提供的全量未经处理的原始财务数据（包括历史财报、实时行情、分析师预测、现金流等）。"
+        "你需要阅读我提供的精简财务数据包。"
         "请用**专业、科学、辩证**的角度评估这些数据。"
         "**要求：**"
         "1. 字数严格限制在50字以内，简明扼要。"
@@ -128,16 +236,15 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, sum
         "3. 用白话的形式告诉用户现在的股价是个什么位置（不要展示PEEV/EBITDA、PEG (Forward)、Adj FCF Yield、ROIC、PEG (TTM)数据），分析短期和长期有什么不同价值"
         "4. 需要综合市场份额、行业地位、资本支出、行业趋势等因素做出理性判断。"
         "5. 不仅要看当下，更要用发展，向前看的视角对增长做出评估。"
-        "6. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
+        "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
 
     try:
-        # 使用 ensure_ascii=False 减少转义字符占用，但 deepseek 英文无所谓
-        data_context = json.dumps(summary_data, indent=2)
+        data_context = json.dumps(simplified_data, default=str)
     except Exception:
         data_context = "数据序列化失败"
 
-    user_prompt = f"股票代码：{ticker}。这是该股票的关键估值数据摘要：\n```json\n{data_context}\n```\n请根据上述数据生成一段策略评估。"
+    user_prompt = f"股票代码：{ticker}。这是该股票的精简API数据：\n{data_context}\n请根据上述数据生成一段策略评估。"
 
     payload = {
         "model": "deepseek-chat",
@@ -146,7 +253,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, sum
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 1.3, 
-        "max_tokens": 150, # 稍微增加一点 buffer，但回复要求50字
+        "max_tokens": 100,
         "stream": False
     }
 
@@ -209,22 +316,6 @@ class ValuationModel:
         self.strategy = "数据不足"  
         self.fcf_yield_display = "N/A" 
         self.fcf_yield_api = None 
-        # 缓存中间计算变量用于 prepare_ai_payload
-        self.cache = {
-            "peg_forward": None,
-            "peg_ttm": None,
-            "ev_ebitda": None,
-            "ps_ratio": None,
-            "pe_ttm": None,
-            "roic": None,
-            "net_margin": None,
-            "op_margin": None,
-            "adj_fcf_yield": None,
-            "meme_score": 0,
-            "rev_growth_ttm": None,
-            "fwd_growth": None,
-            "gross_margin": None
-        }
 
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
@@ -321,8 +412,8 @@ class ValuationModel:
             
             roic = self.extract(m, "returnOnInvestedCapitalTTM", "ROIC", required=False)
             net_margin = self.extract(r, "netProfitMarginTTM", "Net Margin", required=False)
+            # --- 新增：营业利润率提取 (用于更科学的盈利判定) ---
             op_margin = self.extract(r, "operatingProfitMarginTTM", "Op Margin", required=False)
-            gross_margin = self.extract(r, "grossProfitMarginTTM", "Gross Margin", required=False) # 新增
 
             ps_ratio = self.extract(r, "priceToSalesRatioTTM", "P/S", required=False)
             
@@ -332,7 +423,7 @@ class ValuationModel:
             ni_growth = self.extract(g, "netIncomeGrowth", "NI Growth", required=False)
             rev_growth = self.extract(g, "revenueGrowth", "Rev Growth", required=False)
 
-            # 盈利检查
+            # 盈利检查 & 日志修复
             eps_ttm = r.get("netIncomePerShareTTM") or m.get("netIncomePerShareTTM")
             latest_eps = 0
             
@@ -346,7 +437,13 @@ class ValuationModel:
                 latest_q = sorted_earnings_for_check[0]
                 val = latest_q.get("epsActual")
                 latest_eps = val if val is not None else 0
-            
+                logger.info(f"[Earnings] Latest: {latest_q.get('date')} | EPS: {val}")
+            else:
+                logger.info("[Earnings] No past earnings data found.")
+
+            # --- 修改后的严格盈利判定逻辑 (针对 INTC 等) ---
+            # 只有当 EPS > 0 且 营业利润率 > 0 且 净利率 > 0 时，才算“盈利”。
+            # 这样可以排除掉靠税收抵扣/资产出售盈利但主营亏损的公司。
             is_profitable_strict = (
                 (eps_ttm is not None and eps_ttm > 0) and 
                 (latest_eps >= 0) and 
@@ -357,11 +454,17 @@ class ValuationModel:
             # 资产负债
             cash = self.extract(bs, "cashAndCashEquivalents", "Cash", required=False, default=0)
             debt = self.extract(bs, "totalDebt", "Total Debt", required=False, default=0)
+            is_cash_rich = (cash > debt) if (cash is not None and debt is not None) else False
+
+            # 日志快照
+            logger.info(f"[Data Snapshot] Price: {price} | MCap: {format_market_cap(m_cap)} | Beta: {beta} | Sector: {sector}")
+            logger.info(f"[Metric Snapshot] EV/EBITDA: {format_num(ev_ebitda)} | PS: {format_num(ps_ratio)} | ROIC: {format_percent(roic)} | Margin: {format_percent(net_margin)} | OpMargin: {format_percent(op_margin)}")
 
             # === 4. Forward PEG 计算 ===
             forward_peg = None
             fwd_pe = None
             fwd_growth = None
+            eps_fy1_val = None 
             
             if estimates and len(estimates) > 0 and price:
                 try:
@@ -371,6 +474,7 @@ class ValuationModel:
                     if len(future_estimates) >= 2:
                         fy1 = future_estimates[0]; fy2 = future_estimates[1] 
                         eps_fy1 = fy1.get("epsAvg"); eps_fy2 = fy2.get("epsAvg")
+                        eps_fy1_val = eps_fy1 
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None:
                             fwd_pe = price / eps_fy1
@@ -383,6 +487,8 @@ class ValuationModel:
             peg_used = forward_peg if forward_peg is not None else peg_ttm
             is_forward_peg_used = (forward_peg is not None)
             
+            logger.info(f"[PEG Decision] Forward: {format_num(forward_peg)} | TTM: {format_num(peg_ttm)} | Used: {format_num(peg_used)}")
+
             # Growth Desc
             growth_list = [x for x in [rev_growth, ni_growth, fwd_growth] if x is not None]
             max_growth = max(growth_list) if growth_list else 0
@@ -417,8 +523,10 @@ class ValuationModel:
             if fcf_yield_used == fcf_yield_api:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
+            logger.info(f"[Cash Flow] TTM FCF Yield: {format_percent(fcf_yield_api)} | Adj FCF Yield: {format_percent(adj_fcf_yield)}")
+
             # --- 赛道识别 ---
-            is_blue_ocean = False        
+            is_blue_ocean = False         
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
@@ -448,9 +556,17 @@ class ValuationModel:
             # --- VIX & VaR (Scientific Update) ---
             vix_val = self.extract(vix_data, "price", "VIX", default=20)
             if price and beta and vix_val:
+                # 科学 VaR 计算 (Parametric Method)
+                # 1. 股票年化波动率 = VIX (市场年化) * Beta (假设单因子模型)
                 stock_annual_vol = (vix_val / 100.0) * beta
+                
+                # 2. 转换为月度波动率 (除以 sqrt(12))
                 stock_monthly_vol = stock_annual_vol / math.sqrt(12)
+                
+                # 3. 计算 95% Confidence Level 的单尾 VaR
+                # Z-score for 95% = 1.645
                 var_decimal = 1.645 * stock_monthly_vol
+                
                 self.risk_var = f"-{var_decimal * 100:.1f}%"
             
             # --- Meme ---
@@ -536,12 +652,14 @@ class ValuationModel:
                     if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 1.5):
                         st_status = "便宜 (高成长)"
                         self.logs.append(f"[成长特权] 虽 EV/EBITDA ({format_num(ev_ebitda)}) 偏高，但 PEG ({format_num(peg_used)}) 极低，属于越涨越便宜。")
+                        # 修复：NFLX Short Term 策略真空
                         if self.strategy == "数据不足":
                             self.strategy = "PEG极低且具备高成长属性，市场低估了其增长爆发力，属于极具性价比的进攻型标的。"
 
                     elif adjusted_ratio < 0.7:
                         st_status = "便宜"
                         self.logs.append(f"[板块] EV/EBITDA ({format_num(ev_ebitda)}) 低于行业均值 ({sector_avg})，折扣明显。")
+                        # 修复：低估值但非高成长的策略真空
                         if self.strategy == "数据不足":
                             self.strategy = "当前估值显著低于行业平均水平，具备安全边际。建议关注是否有基本面改善的催化剂以修复估值。"
 
@@ -549,6 +667,7 @@ class ValuationModel:
                         if ("高速" in growth_desc or "预期" in growth_desc) and (peg_used is not None and 0 < peg_used < 2.0):
                             st_status = "合理溢价"
                             self.logs.append(f"[成长特权] 高估值 ({format_num(ev_ebitda)}) 被高增长消化，溢价合理。")
+                            # 修复：合理溢价的策略真空
                             if self.strategy == "数据不足":
                                 self.strategy = "高估值由高增长支撑，只要业绩增速维持，股价仍有上行空间，但需紧密跟踪财报。"
                         else:
@@ -666,6 +785,7 @@ class ValuationModel:
                         if fcf_yield_used < fcf_threshold and is_high_quality_growth and not is_faith_mode:
                             lt_status = "预期驱动/投资扩张"
                             self.logs.append(f"[辩证] FCF Yield ({fcf_str}) 较低，但高增长/高ROIC ({format_percent(roic)}) 表明其 CapEx 多为**增长性投资**，当前估值是合理的增长溢价。")
+                            # 修复：NFLX Long Term 策略真空
                             if self.strategy == "数据不足":
                                 self.strategy = "基本面强劲，当前处于高投入换高增长阶段。投资逻辑应侧重于未来的业绩释放能力，而非当下的现金流回报。"
                         elif fcf_yield_used < fcf_threshold and not is_high_quality_growth and not is_faith_mode:
@@ -673,7 +793,7 @@ class ValuationModel:
                             self.logs.append(f"[价值] FCF Yield ({fcf_str}) 极低且无明显高增长支撑，隐含预期过高，风险较大。")
                             if self.strategy == "数据不足": self.strategy = "风险收益比不佳，当前估值缺乏基本面支撑，应审慎。"
                         
-                # ROIC Logic
+                # 修复: 将 ROIC 逻辑从 FCF 的 elif 链条中解耦出来，改为独立 if
                 if roic and roic > 0.20 and (not is_faith_mode or (is_giant and meme_pct < 80)): 
                     lt_status = "优质/值得等待"
                     has_value_fix_log = any("[价值修正]" in x for x in self.logs)
@@ -682,6 +802,8 @@ class ValuationModel:
                     
                     if self.strategy == "数据不足" or "风险" in self.strategy or "高投入" in self.strategy:
                         is_peg_safe = peg_used is None or peg_used < 2.2 
+                        
+                        # 【逻辑升级】增加 FCF 门槛，区分“黄金窗口”与“优质扩张”
                         is_cash_flow_safe = adj_fcf_yield is not None and adj_fcf_yield > 0.015
 
                         if ev_ebitda is not None and ev_ebitda < sector_avg * 0.9 and is_peg_safe:
@@ -761,23 +883,6 @@ class ValuationModel:
                     self.logs.append(f"[防御] Beta ({format_num(beta)}) 极低且现金流健康，具备类似债券的特征。")
 
             self.long_term_verdict = lt_status
-            
-            # --- 缓存关键数据供 AI Payload 使用 ---
-            self.cache.update({
-                "peg_forward": forward_peg,
-                "peg_ttm": peg_ttm,
-                "ev_ebitda": ev_ebitda,
-                "ps_ratio": ps_ratio,
-                "pe_ttm": pe_ttm,
-                "roic": roic,
-                "net_margin": net_margin,
-                "op_margin": op_margin,
-                "adj_fcf_yield": adj_fcf_yield,
-                "meme_score": meme_score,
-                "rev_growth_ttm": rev_growth,
-                "fwd_growth": fwd_growth,
-                "gross_margin": gross_margin
-            })
 
             return {
                 "price": price,
@@ -793,109 +898,6 @@ class ValuationModel:
         except Exception as e:
             logger.error(f"Analyze Error: {e}")
             return None
-
-    def prepare_ai_payload(self):
-        """
-        专为 DeepSeek 优化的精简数据包生成器 (Tokens Saving)
-        """
-        p = self.data.get("profile", {}) or {}
-        q = self.data.get("quote", {}) or {}
-        bs = self.data.get("bs", {}) or {}
-        earnings_raw = self.data.get("earnings", []) or []
-        g = self.data.get("growth", {}) or {} 
-        
-        # 1. Price Context
-        price = self.extract(q, "price", "Price", default=0)
-        high52 = self.extract(q, "yearHigh", "YearHigh", default=0)
-        low52 = self.extract(q, "yearLow", "YearLow", default=0)
-        
-        pos_str = "N/A"
-        if high52 > 0 and low52 > 0:
-            if price >= high52 * 0.95: pos_str = "Near All-Time High"
-            elif price <= low52 * 1.1: pos_str = "Near 52W Low"
-            else: pos_str = "Mid Range"
-        
-        # 2. Earnings Trend (Top 4)
-        formatted_earnings = []
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        if isinstance(earnings_raw, list):
-            # 过滤掉未来的，按日期降序
-            past = [e for e in earnings_raw if e.get("date", "9999") <= today_str]
-            past.sort(key=lambda x: x.get("date", ""), reverse=True)
-            top4 = past[:4]
-            for e in top4:
-                d = e.get("date", "N/A")
-                rev = e.get("revenueActual")
-                rev_str = format_market_cap(rev) if rev else "N/A"
-                act = e.get("epsActual")
-                est = e.get("epsEstimated")
-                status = "N/A"
-                if act is not None and est is not None:
-                    status = "Beat" if act > est else ("Miss" if act < est else "Meet")
-                formatted_earnings.append(f"{d} | Rev: {rev_str} | EPS: {status}")
-
-        # 3. Shareholder Return (Dilution)
-        shares_growth = self.extract(g, "weightedAverageSharesGrowth", "Shares Growth", required=False)
-        shares_trend = "Stable"
-        if shares_growth:
-            if shares_growth > 0.01: shares_trend = f"Dilution (+{shares_growth*100:.1f}%)"
-            elif shares_growth < -0.01: shares_trend = f"Buyback ({shares_growth*100:.1f}%)"
-        
-        # 4. Solvency
-        total_cash = self.extract(bs, "cashAndCashEquivalents", "Cash", default=0)
-        total_debt = self.extract(bs, "totalDebt", "Debt", default=0)
-        net_cash_pos = "Net Cash" if total_cash > total_debt else "Net Debt"
-
-        c = self.cache # 简写
-
-        payload = {
-            "profile": {
-                "symbol": p.get("symbol"),
-                "price": price,
-                "market_cap": format_market_cap(p.get("mktCap")),
-                "sector": p.get("sector"),
-                "industry": p.get("industry"),
-                "beta": p.get("beta")
-            },
-            "price_context": {
-                "current_price": price,
-                "range_52w_low": low52,
-                "range_52w_high": high52,
-                "position": pos_str
-            },
-            "valuation_ratios": {
-                "ev_ebitda": format_num(c["ev_ebitda"]) if c["ev_ebitda"] else "N/A",
-                "ps_ratio": format_num(c["ps_ratio"]) if c["ps_ratio"] else "N/A",
-                "peg_ttm": format_num(c["peg_ttm"]) if c["peg_ttm"] else "N/A",
-                "peg_forward": format_num(c["peg_forward"]) if c["peg_forward"] else "N/A",
-                "pe_ttm": format_num(c["pe_ttm"]) if c["pe_ttm"] else "N/A"
-            },
-            "growth_efficiency": {
-                "revenue_growth_ttm": format_percent(c["rev_growth_ttm"]),
-                "revenue_growth_next_year_est": format_percent(c["fwd_growth"]),
-                "roic": c["roic"] if c["roic"] is not None else "N/A",
-                "net_margin": c["net_margin"] if c["net_margin"] is not None else "N/A",
-                "gross_margin": c["gross_margin"] if c["gross_margin"] is not None else "N/A"
-            },
-            "cash_flow_and_solvency": {
-                "adj_fcf_yield": format_percent(c["adj_fcf_yield"]) if c["adj_fcf_yield"] else self.fcf_yield_display,
-                "total_cash": format_market_cap(total_cash),
-                "total_debt": format_market_cap(total_debt),
-                "net_cash_position": net_cash_pos
-            },
-            "shareholder_return": {
-                "dividend_yield": "N/A", # FMP quote usually has this but we skipped getting it specifically, keep simple
-                "shares_outstanding_trend": shares_trend
-            },
-            "earnings_trend_4q": formatted_earnings,
-            "sentiment_factors": {
-                "meme_score": int(c["meme_score"] * 10), # convert 0-10 back to 0-100
-                "risk_var_95": self.risk_var,
-                "short_term_verdict": self.short_term_verdict,
-                "long_term_verdict": self.long_term_verdict
-            }
-        }
-        return payload
 
 class AnalysisBot(commands.Bot):
     def __init__(self):
@@ -954,12 +956,10 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         await interaction.followup.send(f"[Warning] 数据不足。", ephemeral=ephemeral_result)
         return
 
-    # *** AI 策略生成 (DeepSeek) - 优化版 ***
-    # 1. 生成精简版 payload
-    ai_payload = model.prepare_ai_payload()
-    
-    # 2. 发送给 DeepSeek
-    ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, ai_payload)
+    # *** AI 策略生成 (DeepSeek) ***
+    # 使用 AI 覆盖原本硬编码的 strategy
+    # 修改：传入 model 实例以便提取计算好的字段 (如 verdicts, adj_fcf 等)
+    ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
     if ai_strategy:
         model.strategy = ai_strategy
 
@@ -1013,8 +1013,10 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         else:
             formatted_logs.append(f"> {log}")
 
+    # 撤回修改: 恢复因子列表内部的空引用条间隔
     factor_str = "\n> \n".join(formatted_logs)
     strategy_text = f"**[策略]** {model.strategy}"
+    # 保持修改: 因子列表与策略之间只使用单换行符，防止间距过大
     full_log_str = f"{factor_str}\n{strategy_text}"
     
     if len(full_log_str) > 1000: full_log_str = full_log_str[:990] + "..."
