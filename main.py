@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Optional
 
+# --- 新增：引入 tenacity 用于重试机制 ---
+import tenacity
+
 # 加载环境变量
 load_dotenv()
 
@@ -24,6 +27,10 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
+
+# --- 新增：全局并发信号量 (限制同时请求 DeepSeek 的数量为 3) ---
+# 防止瞬间并发过高导致 429 Too Many Requests 或 IP 封禁
+DEEPSEEK_SEM = asyncio.Semaphore(3)
 
 # --- 白名单 ---
 HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL"]
@@ -109,8 +116,18 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
     data = await get_json_safely(session, url)
     return data if data else []
 
-# --- 2. DeepSeek AI 策略生成 (已优化数据包 & PEG修复) ---
+# --- 2. DeepSeek AI 策略生成 (包含并发保护与重试机制) ---
 
+# 使用 tenacity 装饰器：
+# stop=stop_after_attempt(3): 最多重试3次
+# wait=wait_exponential(...): 失败后等待时间指数增长 (2s, 4s, 8s...)
+# retry=retry_if_exception_type(...): 只有遇到网络错误或超时才重试，逻辑错误不重试
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
+    retry=tenacity.retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+    reraise=True 
+)
 async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, model):
     if not DEEPSEEK_API_KEY:
         return "DeepSeek API Key 未配置，无法生成智能策略。"
@@ -136,7 +153,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         elif price <= low_52 * 1.10: pos_str = "Near 52W Low"
         else: pos_str = "Mid Range"
 
-    # 辅助：计算 PEG Forward (修复逻辑：使用2年CAGR)
+    # 辅助：计算 PEG Forward (已修复逻辑：使用2年CAGR)
     peg_fwd_val = "N/A"
     try:
         if len(estimates) >= 2 and price:
@@ -148,10 +165,10 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 # 必须 eps1 > 0 且 eps2 > 0 才能做幂运算开根号
                 if eps1 and eps1 > 0 and eps2 and eps2 > 0:
                     fwd_pe = price / eps1
-                    # [修复] 使用图片建议的公式: ((eps2/eps1)**0.5 - 1)
-                    growth = (eps2 / eps1) ** 0.5 - 1
-                    if growth > 0:
-                        peg_fwd_val = round(fwd_pe / (growth * 100), 2)
+                    # [修复] 使用 2年 CAGR: ((eps2/eps1)**0.5 - 1)
+                    fwd_growth = (eps2 / eps1) ** 0.5 - 1
+                    if fwd_growth > 0:
+                        peg_fwd_val = round(fwd_pe / (fwd_growth * 100), 2)
     except: pass
 
     # 辅助：Earnings 格式化
@@ -222,7 +239,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         }
     }
 
-    # --- 2. 发送请求 ---
+    # --- 2. 准备请求 Payload ---
     system_prompt = (
         "你是一位拥有十年经验的资深美股交易员和华尔街机构分析师。你精通基本面分析、估值建模和市场情绪判断。"
         "你需要阅读我提供的精简财务数据包。"
@@ -259,18 +276,26 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
 
-    try:
-        async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
-            if response.status == 200:
-                result = await response.json()
-                content = result['choices'][0]['message']['content']
-                return content.strip()
-            else:
-                logger.error(f"DeepSeek API Error: {response.status}")
-                return "AI 策略生成超时或失败，请参考上方因子分析。"
-    except Exception as e:
-        logger.error(f"DeepSeek Request Failed: {e}")
-        return "AI 连接中断。"
+    # --- 3. 发送请求 (使用信号量保护 + 自动重试) ---
+    async with DEEPSEEK_SEM: # 限制并发数
+        try:
+            async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    content = result['choices'][0]['message']['content']
+                    return content.strip()
+                else:
+                    logger.error(f"DeepSeek API Error: {response.status}")
+                    # 非200错误，如果不希望重试（如400 Bad Request），可以在这里直接返回
+                    # 但为了简单，这里让它通过外层的 ClientError 捕获或者直接返回错误信息
+                    if 500 <= response.status < 600:
+                         # 抛出异常触发 tenacity 重试
+                         raise aiohttp.ClientError(f"Server Error {response.status}")
+                    return "AI 策略生成超时或失败，请参考上方因子分析。"
+        except Exception as e:
+            # 抛出异常给 tenacity 捕获，进行重试
+            logger.warning(f"DeepSeek Attempt Failed: {e}, retrying...")
+            raise e
 
 # --- 3. 辅助格式化函数 ---
 
@@ -949,10 +974,14 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
         return
 
     # *** AI 策略生成 (DeepSeek) ***
-    # 使用 AI 覆盖原本硬编码的 strategy
-    ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
-    if ai_strategy:
-        model.strategy = ai_strategy
+    try:
+        # 使用 AI 覆盖原本硬编码的 strategy
+        ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
+        if ai_strategy:
+            model.strategy = ai_strategy
+    except Exception as e:
+        logger.error(f"AI Strategy failed after retries: {e}")
+        model.strategy = "AI 服务暂时不可用，请参考上方因子分析。"
 
     profit_label = "盈利" if data.get('is_profitable', False) else "亏损"
 
