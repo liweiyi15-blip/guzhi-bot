@@ -35,8 +35,8 @@ PRIVACY_MODE = {}
 # ttl=600: 数据有效期 600秒 (10分钟)，期间重复查询不消耗 FMP 额度
 FMP_CACHE = TTLCache(maxsize=2000, ttl=600)
 
-# --- 白名单 ---
-HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL"]
+# --- 白名单 (仅保留用于赛道识别，不再用于加分) ---
+HARD_TECH_TICKERS = ["RKLB", "LUNR", "ASTS", "SPCE", "PLTR", "IONQ", "RGTI", "DNA", "JOBY", "ACHR", "BABA", "NIO", "XPEV", "LI", "TSLA", "NVDA", "AMD", "MSFT", "GOOG", "GOOGL", "AMZN", "AAPL", "MSTR", "COIN"]
 
 # --- 关键词词典 ---
 BLUE_OCEAN_KEYWORDS = ["aerospace", "defense", "space", "satellite", "rocket", "quantum"]
@@ -122,7 +122,7 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
     data = await get_json_safely(session, url_profile)
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
-       
+        
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
@@ -134,7 +134,7 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
             "mktCap": item.get("marketCap"),
             "companyName": item.get("companyName"),
             "industry": item.get("industry"), 
-            "sector": item.get("sector"),      
+            "sector": item.get("sector"),       
             "description": "Fetched via Screener",
             "image": "N/A"
         }
@@ -261,7 +261,8 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         },
         "earnings_trend_4q": earnings_list,
         "sentiment_factors": {
-            "meme_score": model.meme_pct, # [修复] 这里直接读取模型中计算好的最新加权分，而不是去 raw data 里找
+            "meme_score": f"{model.meme_pct}/100", # [重要] 传递更新后的Meme分给AI
+            "meme_analysis": "Meme值由换手率(资金活跃度)、RVOL(量比突变)、P/S(估值情绪)和均线乖离率综合计算得出。",
             "risk_var_95": model.risk_var,
             "short_term_verdict": model.short_term_verdict,
             "long_term_verdict": model.long_term_verdict
@@ -278,6 +279,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "3. 用白话的形式告诉用户现在的股价是个什么位置（不要展示PEEV/EBITDA、PEG (Forward)、Adj FCF Yield、ROIC、PEG (TTM)数据），分析短期和长期有什么不同价值"
         "4. 需要综合市场份额、行业地位、资本支出、行业趋势等因素做出理性判断。"
         "5. 不仅要看当下，更要用发展，向前看的视角对增长做出评估。"
+        "6. **高度关注情绪因子**：如果 'sentiment_factors' 中的 meme_score 极高（>80），说明当前该股处于量价齐升的资金狂热期（由高换手和高量比驱动），此时基本面估值可能暂时失效，请在建议中重点提示波动风险和动量机会。"
         "7. 最后必须给一些持仓建议，有必要的时候还要提示风险，不要给具体的目标价。"
     )
 
@@ -295,7 +297,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 1.3, 
-        "max_tokens": 100,
+        "max_tokens": 150,
         "stream": False
     }
 
@@ -314,7 +316,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
                 else:
                     logger.error(f"DeepSeek API Error: {response.status}")
                     if 500 <= response.status < 600:
-                         raise aiohttp.ClientError(f"Server Error {response.status}")
+                          raise aiohttp.ClientError(f"Server Error {response.status}")
                     return "AI 策略生成超时或失败，请参考上方因子分析。"
         except Exception as e:
             logger.warning(f"DeepSeek Attempt Failed: {e}, retrying...")
@@ -442,10 +444,13 @@ class ValuationModel:
             # === 1. 基础数据 ===
             price = self.extract(q, "price", "Quote Price", default=p.get("price"))
             price_200ma = self.extract(q, "priceAvg200", "200 Day MA", required=False)
+            low_52 = self.extract(q, "yearLow", "52W Low", required=False)
             sector = self.extract(p, "sector", "Sector", default="Unknown")
             industry = self.extract(p, "industry", "Industry", default="Unknown")
             beta = self.extract(p, "beta", "Beta", default=1.0)
             m_cap = self.extract(q, "marketCap", "MarketCap", default=p.get("mktCap"))
+            # [新增] 提前获取流通股数，用于 Meme 计算
+            shares_out = self.extract(bs, "commonStockSharesOutstanding", "Shares", required=False)
             
             # === 2. 财务指标 ===
             ev_ebitda = self.extract(r, "enterpriseValueMultipleTTM", "EV/EBITDA", required=False)
@@ -512,7 +517,7 @@ class ValuationModel:
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
-                            fwd_growth = (eps2 / eps1) ** 0.5 - 1
+                            fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
                 except Exception:
@@ -561,7 +566,7 @@ class ValuationModel:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
             # --- 赛道识别 ---
-            is_blue_ocean = False          
+            is_blue_ocean = False           
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
@@ -596,37 +601,63 @@ class ValuationModel:
                 var_decimal = 1.645 * stock_monthly_vol
                 self.risk_var = f"-{var_decimal * 100:.1f}%"
             
-            # --- Meme Score (Weighted Logic Upgrade) ---
+            # --- Meme Score (Scientific v3.0) ---
+            # [核心修改] 移除白名单暴击，采用纯数据驱动
             meme_score = 0
             vol_today = self.extract(q, "volume", "Volume", required=False)
-            vol_avg = self.extract(q, "avgVolume", "Avg Volume", required=False)
+            vol_avg = self.extract(q, "avgVolume", "Avg Vol", required=False)
+            # shares_out 已在上方提取
+
+            # 1. 换手率 (Turnover) - 基础热度 (权重: 35)
+            # 科学依据: 换手率是衡量散户参与度最直接的指标。
+            if vol_today and shares_out and shares_out > 0:
+                turnover = vol_today / shares_out
+                # 换手率 1% = 2.5分。
+                # TSLA 常态 3%-5% -> 7.5-12.5分
+                # 爆炒股 15% -> 37.5分 (封顶 35)
+                score_turnover = min(turnover * 100 * 2.5, 35)
+                meme_score += score_turnover
             
-            # 1. 价格偏离度 (max 30分)
-            if price and price_200ma and price_200ma > 0:
-                deviation = (price / price_200ma) - 1
-                score_part = max(deviation * 30, 0) # 只有正偏离才加分
-                meme_score += min(score_part, 30)
-                
-            # 2. P/S 估值热度 (max 30分)
-            if ps_ratio:
-                score_part = ps_ratio / 2.0
-                meme_score += min(score_part, 30)
-                
-            # 3. 超额 Beta (max 20分)
-            if beta:
-                score_part = max((beta - 1) * 20, 0)
-                meme_score += min(score_part, 20)
-                
-            # 4. 成交量异动 (20分)
+            # 2. 量比 (Relative Volume, RVOL) - 突发热度 (权重: 25)
+            # 科学依据: 只有成交量显著放大(RVOL > 1.5)，才说明有突发资金进场。
             if vol_today and vol_avg and vol_avg > 0:
-                if vol_today > vol_avg * 3: # 3倍量爆炸
-                    meme_score += 20
-                elif vol_today > vol_avg * 1.5:
-                    meme_score += 10
-                    
-            meme_pct = int(min(meme_score, 100)) # 归一化到 0-100
-            self.meme_pct = meme_pct # [重要] 存入 self，供 DeepSeek 读取
-            is_faith_mode = meme_pct >= 50
+                rvol = vol_today / vol_avg
+                # RVOL < 1.0 : 0分
+                # RVOL 1.5 : 10分
+                # RVOL 3.0 : 25分 (满分)
+                if rvol > 1.0:
+                    score_rvol = min((rvol - 1.0) * 12.5, 25)
+                    meme_score += score_rvol
+
+            # 3. 估值泡沫度 (P/S) - 想象力溢价 (权重: 20)
+            # 科学依据: 高P/S意味着脱离引力，纯靠情绪和故事驱动。
+            if ps_ratio:
+                # P/S 10 -> 10分
+                # P/S 20 -> 20分
+                score_ps = min(ps_ratio, 20)
+                meme_score += score_ps
+
+            # 4. 波动率 (Beta) - 投机属性 (权重: 10)
+            if beta:
+                # Beta 1.0 -> 0分
+                # Beta 2.0 -> 10分
+                score_beta = max((beta - 1.0) * 10, 0)
+                meme_score += min(score_beta, 10)
+
+            # 5. 技术乖离率 (Price vs MA200) - 趋势强度 (权重: 10)
+            # 科学依据: 只有价格在均线之上且远离均线，才叫主升浪。
+            if price and price_200ma and price_200ma > 0:
+                bias = (price / price_200ma) - 1
+                if bias > 0:
+                     # 偏离 20% -> 5分
+                     # 偏离 40% -> 10分
+                     score_bias = min(bias * 25, 10)
+                     meme_score += score_bias
+
+            # 归一化 (允许稍微溢出后截断)
+            meme_pct = int(min(meme_score, 100)) 
+            self.meme_pct = meme_pct 
+            is_faith_mode = meme_pct >= 60
 
             # === 9. 估值与策略判定 ===
             sector_avg = get_sector_benchmark(sector)
@@ -757,20 +788,18 @@ class ValuationModel:
                 # Meme
                 if is_faith_mode:
                     meme_log = ""
-                    meme_strategy_text = "价格波动性可能增加，交易决策可以结合市场动量指标。"
-                    if 50 <= meme_pct < 60:
+                    meme_strategy_text = "资金情绪极度亢奋，基本面估值已失效，交易决策建议跟随趋势指标（如RSI或均线）。"
+                    if 60 <= meme_pct < 70:
                         meme_log = f"[信仰] Meme值 {meme_pct}%。市场关注度提升，资金动量正在影响短期价格走势。"
-                    elif 60 <= meme_pct < 70:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪高度活跃，体现出显著的**资金共识**和高流动性。"
                     elif 70 <= meme_pct < 80:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，公司获得大量**关注溢价**，价格驱动力强劲。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。资金聚焦度极高，价格由流动性驱动，存在明显的**溢价**。"
                     elif 80 <= meme_pct < 90:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪已进入非理性繁荣区间，价格体现出**极致的资金动能**。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场进入狂热阶段，基本面因子失效，**资金博弈**成为主导。"
                     elif meme_pct >= 90:
-                        meme_log = f"[信仰] Meme值 {meme_pct}%。市场情绪处于顶峰，反映出**极强的短期向上动量**。"
+                        meme_log = f"[信仰] Meme值 {meme_pct}%。**极致的逼空行情**，情绪见顶，波动风险极大。"
                     
                     if is_giant and meme_pct < 80:
-                        if meme_log: self.logs.insert(0, meme_log)
+                         if meme_log: self.logs.insert(0, meme_log)
                     else:
                         if meme_log: self.logs.insert(0, meme_log)
                         if "昂贵" in st_status: st_status += " / 资金动量"
