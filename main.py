@@ -9,7 +9,8 @@ import json
 import math
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Tuple
+from collections import defaultdict
 
 # --- 外部库引入 ---
 import tenacity # 用于 DeepSeek 重试
@@ -28,10 +29,6 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # --- 全局状态 ---
 PRIVACY_MODE = {}
-
-# --- 全局并发限制 (DeepSeek) ---
-# 限制同时请求 DeepSeek 的数量为 3，防止被封 IP
-DEEPSEEK_SEM = asyncio.Semaphore(3)
 
 # --- 全局缓存 (FMP) ---
 # maxsize=2000: 最多缓存2000个请求结果
@@ -53,15 +50,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ValuationBot")
 
+# --- 0. 限流模块 (新增) ---
+# 记录用户调用时间戳： user_id -> [timestamp1, timestamp2, ...]
+USER_CALLS = defaultdict(list)
+MAX_CALLS_PER_MIN = 6   # 个人每分钟最多6次
+MAX_CALLS_PER_HOUR = 60 # 每小时最多60次
+
+def is_rate_limited(user_id: int) -> Tuple[bool, str]:
+    now = datetime.now()
+    user_history = USER_CALLS[user_id]
+    
+    # 清理过期记录 (只保留最近1小时的)
+    valid_history = [t for t in user_history if t > now - timedelta(hours=1)]
+    USER_CALLS[user_id] = valid_history
+    
+    # 检查每分钟限制
+    recent_min = [t for t in valid_history if t > now - timedelta(minutes=1)]
+    if len(recent_min) >= MAX_CALLS_PER_MIN:
+        return True, "每分钟调用次数超限 (Max 6次/分)，请稍后。"
+
+    # 检查每小时限制
+    if len(valid_history) >= MAX_CALLS_PER_HOUR:
+        return True, "每小时调用次数超限 (Max 60次/小时)，请休息一下。"
+
+    # 记录本次调用
+    USER_CALLS[user_id].append(now)
+    return False, ""
+
 # --- 1. 异步数据工具函数 (含缓存逻辑) ---
 
 async def get_json_safely(session: aiohttp.ClientSession, url: str):
     # 1. 检查缓存
     if url in FMP_CACHE:
-        # 命中缓存：直接返回，不打印日志以免刷屏，省钱！
         return FMP_CACHE[url]
 
     # --- 日志脱敏处理 ---
+    # 即使 URL 里带 key，我们在打印日志时把它替换掉
     safe_url = url.replace(FMP_API_KEY, "******") if FMP_API_KEY else url
     
     try:
@@ -100,7 +124,7 @@ async def get_company_profile_smart(session: aiohttp.ClientSession, ticker: str)
     data = await get_json_safely(session, url_profile)
     if data and isinstance(data, list) and len(data) > 0:
         return data[0]
-      
+       
     url_screener = f"{BASE_URL}/stock-screener?symbol={ticker}&apikey={FMP_API_KEY}"
     data_scr = await get_json_safely(session, url_screener)
     if data_scr and isinstance(data_scr, list) and len(data_scr) > 0:
@@ -137,11 +161,11 @@ async def get_earnings_data(session: aiohttp.ClientSession, ticker: str):
 
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
+    wait=tenacity.wait_fixed(2), # 固定等待2秒，避免指数级等待太久导致Discord超时
     retry=tenacity.retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
     reraise=True 
 )
-async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, model):
+async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, model, semaphore: asyncio.Semaphore):
     if not DEEPSEEK_API_KEY:
         return "DeepSeek API Key 未配置，无法生成智能策略。"
 
@@ -283,7 +307,8 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
 
-    async with DEEPSEEK_SEM: # 并发保护
+    # 使用传入的 semaphore
+    async with semaphore: 
         try:
             async with session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=20) as response:
                 if response.status == 200:
@@ -398,7 +423,6 @@ class ValuationModel:
 
         total_endpoints = len(tasks_generic)
         failed_count = total_endpoints - len(success_keys)
-        # 如果大量使用缓存，这里会显示 API Success，但实际上可能并未发起真实网络请求，这是符合预期的
         logger.info(f"[API Status] Success: {len(success_keys)} | Failed: {failed_count} endpoints.")
         return self.data["profile"] is not None
 
@@ -539,7 +563,7 @@ class ValuationModel:
                 self.fcf_yield_display = format_percent(fcf_yield_api) 
             
             # --- 赛道识别 ---
-            is_blue_ocean = False         
+            is_blue_ocean = False          
             is_hard_tech_growth = False 
             sec_str = str(sector).lower() if sector else ""
             ind_str = str(industry).lower() if industry else ""
@@ -903,6 +927,8 @@ class AnalysisBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
+        # 将信号量移入类中，防止全局变量污染
+        self.deepseek_sem = asyncio.Semaphore(3)
 
     async def setup_hook(self):
         logger.info("Syncing commands...")
@@ -927,6 +953,12 @@ async def privacy(interaction: discord.Interaction):
     await interaction.response.send_message(f"[Info] 隐私模式切换成功。\n当前状态: **{status}**", ephemeral=True)
 
 async def process_analysis(interaction: discord.Interaction, ticker: str, force_private: bool = False):
+    # --- 1. 防刷检查 (Rate Limiting) ---
+    is_limited, limit_msg = is_rate_limited(interaction.user.id)
+    if is_limited:
+        await interaction.response.send_message(f"🚫 {limit_msg}", ephemeral=True)
+        return
+
     is_privacy_mode = force_private or PRIVACY_MODE.get(interaction.user.id, False)
     ephemeral_result = is_privacy_mode
     
@@ -956,7 +988,8 @@ async def process_analysis(interaction: discord.Interaction, ticker: str, force_
 
     try:
         # 使用 AI 覆盖原本硬编码的 strategy
-        ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model)
+        # 传入 bot.deepseek_sem
+        ai_strategy = await ask_deepseek_strategy(interaction.client.session, ticker, model, interaction.client.deepseek_sem)
         if ai_strategy:
             model.strategy = ai_strategy
     except Exception as e:
