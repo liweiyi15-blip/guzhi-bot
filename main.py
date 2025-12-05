@@ -250,7 +250,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
             "gross_margin": safe_fmt(r.get("grossProfitMarginTTM"), True)
         },
         "cash_flow_and_solvency": {
-            "adj_fcf_yield": model.fcf_yield_display,
+            "adj_fcf_yield": model.fcf_yield_display, # 这里读取的是计算后的新 FCF Yield
             "total_cash": format_market_cap(bs.get("cashAndCashEquivalents")),
             "total_debt": format_market_cap(bs.get("totalDebt")),
             "net_cash_position": "Net Cash" if (bs.get("cashAndCashEquivalents", 0) or 0) > (bs.get("totalDebt", 0) or 0) else "Net Debt"
@@ -261,7 +261,7 @@ async def ask_deepseek_strategy(session: aiohttp.ClientSession, ticker: str, mod
         },
         "earnings_trend_4q": earnings_list,
         "sentiment_factors": {
-            "meme_score": model.data.get("meme_pct", 0),
+            "meme_score": model.meme_pct, # [修复] 这里直接读取模型中计算好的最新加权分，而不是去 raw data 里找
             "risk_var_95": model.risk_var,
             "short_term_verdict": model.short_term_verdict,
             "long_term_verdict": model.long_term_verdict
@@ -360,7 +360,8 @@ class ValuationModel:
         self.flags = []  
         self.strategy = "数据不足"  
         self.fcf_yield_display = "N/A" 
-        self.fcf_yield_api = None 
+        self.fcf_yield_api = None
+        self.meme_pct = 0 # [新增] 用于存储计算后的加权 Meme 分数
 
     def extract(self, source, key, desc, default=None, required=True):
         val = source.get(key)
@@ -511,7 +512,7 @@ class ValuationModel:
                         
                         if eps_fy1 is not None and eps_fy1 > 0 and eps_fy2 is not None and eps_fy2 > 0:
                             fwd_pe = price / eps_fy1
-                            fwd_growth = (eps_fy2 / eps_fy1) ** 0.5 - 1
+                            fwd_growth = (eps2 / eps1) ** 0.5 - 1
                             if fwd_growth > 0:
                                 forward_peg = fwd_pe / (fwd_growth * 100)
                 except Exception:
@@ -529,7 +530,7 @@ class ValuationModel:
             elif max_growth > 0.05: growth_desc = "稳健"
             if peg_used and peg_used > 3.0: growth_desc = "高预期"
             
-            # === 5. Adjusted FCF Yield (Logic Upgraded) ===
+            # === 5. Adjusted FCF Yield (New Logic) ===
             adj_fcf_yield = None
             if len(cf_list) >= 4 and m_cap and m_cap > 0:
                 ttm_cfo = 0
@@ -545,8 +546,6 @@ class ValuationModel:
                     else: break 
                 if ttm_cfo != 0 and quarter_count >= 4:
                     # [新逻辑] 动态维护性资本开支比例
-                    # 如果营收增速 > 15%，认为是成长型公司，维护性CapEx较低 (0.3)
-                    # 否则认为是成熟/低速公司，维护性CapEx较高 (0.8)
                     if rev_growth is not None and rev_growth > 0.15:
                         MAINTENANCE_CAPEX_RATIO = 0.3
                     else:
@@ -626,6 +625,7 @@ class ValuationModel:
                     meme_score += 10
                     
             meme_pct = int(min(meme_score, 100)) # 归一化到 0-100
+            self.meme_pct = meme_pct # [重要] 存入 self，供 DeepSeek 读取
             is_faith_mode = meme_pct >= 50
 
             # === 9. 估值与策略判定 ===
